@@ -58,7 +58,7 @@ pub fn strings(db: &Connection, sql: &str, args: impl rusqlite::Params) -> Resul
 }
 pub fn rules(db: &Connection, root: &str) -> Result<Gitignore> {
     let mut b = GitignoreBuilder::new(root);
-    for s in [".git/", "node_modules/", "target/", "__pycache__/", "dist/"] {
+    for s in [".git", "node_modules/", "target/", "__pycache__/", "dist/"] {
         b.add_line(None, s)?;
     }
     for s in strings(db, "SELECT rule FROM rules WHERE root=?", [root])? {

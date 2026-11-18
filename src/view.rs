@@ -1,5 +1,7 @@
 use similar::{ChangeTag, DiffTag, TextDiff};
-use std::time::Duration;
+use std::{ops::Range, time::Duration};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 #[derive(Clone)]
 pub struct Row {
     pub num: usize,
@@ -70,9 +72,137 @@ pub fn content(old: Option<&str>, new: Option<&str>, kind: &str, diff: bool) -> 
     rows
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextPoint {
+    pub row: usize,
+    pub byte: usize,
+}
+
+impl TextPoint {
+    pub fn at_row(row: usize) -> Self {
+        Self { row, byte: 0 }
+    }
+}
+
+struct Continuation {
+    screen_row: usize,
+    point: TextPoint,
+}
+
+#[derive(Default)]
+pub struct WrappedRows {
+    pub width: usize,
+    continuations: Vec<Continuation>,
+}
+
+impl WrappedRows {
+    pub fn new(rows: &[Row], width: usize) -> Self {
+        let width = width.max(1);
+        let mut wrapped = Self {
+            width,
+            continuations: Vec::new(),
+        };
+        for (row, line) in rows.iter().enumerate() {
+            let tabs = line.text.as_bytes().contains(&b'\t');
+            if !tabs && (line.text.len() <= width || line.text.is_ascii()) {
+                for byte in (width..line.text.len()).step_by(width) {
+                    wrapped.push(row, byte);
+                }
+                continue;
+            }
+            let mut used = 0;
+            for (byte, cluster) in line.text.grapheme_indices(true) {
+                let columns = if cluster == "\t" {
+                    4
+                } else if cluster.chars().any(char::is_control) {
+                    crate::syntax::terminal_text(cluster).width()
+                } else {
+                    cluster.width()
+                };
+                if used != 0 && used + columns > width {
+                    wrapped.push(row, byte);
+                    used = 0;
+                }
+                used += columns;
+            }
+        }
+        wrapped
+    }
+
+    fn push(&mut self, row: usize, byte: usize) {
+        self.continuations.push(Continuation {
+            screen_row: row + self.continuations.len() + 1,
+            point: TextPoint { row, byte },
+        });
+    }
+
+    pub fn len(&self, rows: &[Row]) -> usize {
+        rows.len() + self.continuations.len()
+    }
+
+    pub fn index(&self, point: TextPoint) -> usize {
+        point.row
+            + self.continuations.partition_point(|item| {
+                (item.point.row, item.point.byte) <= (point.row, point.byte)
+            })
+    }
+
+    pub fn point(&self, screen_row: usize) -> TextPoint {
+        let before = self
+            .continuations
+            .partition_point(|item| item.screen_row <= screen_row);
+        if before > 0 && self.continuations[before - 1].screen_row == screen_row {
+            self.continuations[before - 1].point
+        } else {
+            TextPoint::at_row(screen_row - before)
+        }
+    }
+
+    pub fn range(&self, screen_row: usize, point: TextPoint, line_bytes: usize) -> Range<usize> {
+        let next = self.point(screen_row + 1);
+        let end = if next.row == point.row {
+            next.byte
+        } else {
+            line_bytes
+        };
+        point.byte..end
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wrapping_preserves_source_rows_and_graphemes() {
+        let rows = content(None, Some("1234567\nA汉e\u{301}👩‍💻B\n\nlast"), "B", false);
+        let wrapped = WrappedRows::new(&rows, 3);
+        let segments: Vec<_> = (0..wrapped.len(&rows))
+            .map(|i| {
+                let point = wrapped.point(i);
+                assert_eq!(wrapped.index(point), i);
+                let row = &rows[point.row];
+                (row.num, &row.text[wrapped.range(i, point, row.text.len())])
+            })
+            .collect();
+        assert_eq!(
+            segments,
+            [
+                (1, "123"),
+                (1, "456"),
+                (1, "7"),
+                (2, "A汉"),
+                (2, "e\u{301}👩‍💻"),
+                (2, "B"),
+                (3, ""),
+                (4, "las"),
+                (4, "t"),
+            ]
+        );
+        let resized = WrappedRows::new(&rows, 6);
+        let anchor = wrapped.point(4);
+        assert_eq!(resized.point(resized.index(anchor)).row, anchor.row);
+    }
+
     #[test]
     fn separate_changes_have_stable_ids_in_text_and_diff() {
         let old = "before\nremoved\nkept\nold value\nafter\n";

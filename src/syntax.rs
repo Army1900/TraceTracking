@@ -220,11 +220,13 @@ impl Syntax {
         Self { starts, ranges }
     }
 
-    pub fn spans(&self, line: usize, text: &str) -> Vec<Span<'static>> {
-        let Some(&start) = line.checked_sub(1).and_then(|i| self.starts.get(i)) else {
-            return vec![Span::raw(terminal_text(text))];
+    pub fn spans_in(&self, line: usize, text: &str, bytes: Range<usize>) -> Vec<Span<'static>> {
+        let Some(&origin) = line.checked_sub(1).and_then(|i| self.starts.get(i)) else {
+            return vec![Span::raw(terminal_text(&text[bytes]))];
         };
-        let end = start + text.len();
+        let text = &text[bytes.clone()];
+        let start = origin + bytes.start;
+        let end = origin + bytes.end;
         let mut spans = Vec::new();
         let mut cursor = start;
         let first = self.ranges.partition_point(|(r, _)| r.end <= start);
@@ -274,7 +276,7 @@ mod tests {
             ("a.md", "# 中文标题", "# 中文标题", "keyword"),
             ("a.xml", "<item name=\"中文\"/>", "name", "attribute"),
         ] {
-            let rendered = Syntax::parse(path, Some(body)).spans(1, body);
+            let rendered = Syntax::parse(path, Some(body)).spans_in(1, body, 0..body.len());
             assert!(
                 rendered
                     .iter()
