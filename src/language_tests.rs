@@ -65,7 +65,14 @@ fn check(case: Case) -> Result<()> {
     let path = Path::new(root).join(case.source);
     fs::write(&path, &next)?;
     store::scan(&mut db, root, &path, &filter, false)?;
-    let history = store::entries(&db, root, false, case.source, "", 0, 0)?;
+    let history = store::entries(
+        &db,
+        store::EntryQuery {
+            root,
+            only: case.source,
+            ..Default::default()
+        },
+    )?;
     assert_eq!(history.len(), 2);
     assert_eq!(history[0].kind, "M");
     let (old, new, _) = store::bodies(&db, history[0].id)?;
@@ -76,11 +83,31 @@ fn check(case: Case) -> Result<()> {
             .any(|line| line.mark == '~' && line.text.contains("new_marker"))
     );
     assert_eq!(
-        store::entries(&db, root, false, case.source, "new_marker", 1, 0)?.len(),
+        store::entries(
+            &db,
+            store::EntryQuery {
+                root,
+                only: case.source,
+                text: "new_marker",
+                mode: 1,
+                ..Default::default()
+            }
+        )?
+        .len(),
         1
     );
     assert_eq!(
-        store::entries(&db, root, false, case.source, "old_marker", 2, 0)?.len(),
+        store::entries(
+            &db,
+            store::EntryQuery {
+                root,
+                only: case.source,
+                text: "old_marker",
+                mode: 2,
+                ..Default::default()
+            }
+        )?
+        .len(),
         1
     );
     fs::remove_dir_all(dir)?;

@@ -67,6 +67,49 @@ tt hook . src/main.rs "Claude Code · session-42"
 
 没有来源证据的保存显示“来源未知”。hook 需要在调用方配置，安装程序不会修改 AI 工具的设置。
 
+## AI 会话追踪
+
+首次按 `a` 打开 AI 视图时，可以用空格或鼠标勾选当前目录关注的工具，按 `n` 登记自定义工具，按 `h` 查看当前工具的 Hook 接入方式，按 `Enter` 保存。以后打开会话面板可按 `c` 修改。关注设置按项目目录保存在应用数据里，影响会话面板、顶部活动和时间轴图标。文件详情仍可以查看已有的来源证据。
+
+按 `a` 打开当前目录的会话面板。方向键选择会话，`Enter` 筛选它的已关联变更，`Esc` 原路返回，`d` 查看对应 diff。顶部显示当前目录的近期会话和收到目标路径的在途写入。会话从父目录启动时，写入当前目录也会出现在面板里。
+
+确保 AI 工具能从 PATH 找到 `tt`，再从下面命令生成 Hook 片段，合并到工具的 Hook 配置中，保留已有 Hook。
+
+```sh
+tt ai-hook-config claude-code
+tt ai-hook-config codex
+```
+
+Claude Code 可合并到 `.claude/settings.local.json` 或用户设置。Codex 可合并到项目的 `.codex/hooks.json` 或用户的 `~/.codex/hooks.json`，并通过工具的 Hook 界面确认配置。默认接入 Claude Code 的 `Edit` / `Write` 与 Codex 的 `apply_patch`。前后 Hook 需要按工具默认的同步方式执行，以便在下一次写入前记录指纹。Hook 只写入必要的本地事件，正文查询、归因和会话汇总在 TraceTracking 后台执行。
+
+已验证的预期内容指纹和观察到的文件快照一致，且一个工具操作能唯一对应当前项目的一次变更时，时间轴显示工具标识。Shell、未知编辑方式、快照合并和竞争写入可能缺少可确认的来源。应用会显示「可能相关」「归属不明」或「来源未知」。超过正文快照大小的文件仍可出现在会话活动里，精确归因需要可比对的快照。
+
+### 自定义工具
+
+向 `tt ai-event` 的 stdin 发送一条 JSON。以下示例注册项目下的一个自定义会话。
+
+```json
+{
+  "version": 1,
+  "tool": "studio",
+  "instance": "local",
+  "session_id": "session-42",
+  "cwd": "/path/to/project",
+  "phase": "session_start",
+  "title": "更新配置"
+}
+```
+
+事件阶段支持 `session_start`、`session_idle`、`session_end`、`write_start`、`write_finish` 和 `write_fail`。写入事件需提供同一次工具调用的 `call_id` 和 `files` 数组。每项必填相对 `cwd` 或绝对的 `path`，可带写入前的 `before` 和预期结果的 `expected_after`。两者用 SHA-256 十六进制表示，文件不存在用 `-`。完成事件可带工具实际捕获的 `observed_after`，省略时 `tt` 在接收事件时读该文件的指纹。工具可额外提交 `turn_id` 和 `model`。原始 Hook JSON、补丁正文和聊天记录保留在各自的工具里。
+
+在关注设置中按 `n` 可为当前项目登记工具 ID、名称、图标和颜色。也可以在应用数据目录放置 `agents.json`，为各项目提供共享的工具配置。设置环境变量 `TT_ASCII=1` 使用 ASCII 图标。
+
+```json
+{
+  "studio": { "name": "Studio Agent", "icon": "◈", "ascii": "S", "color": "#D29FFF" }
+}
+```
+
 ## 验证
 
 `cargo test --locked` 运行测试，`cargo build --release --locked` 构建原生程序。GitHub Actions 配置了三个桌面系统的原生测试和构建任务。

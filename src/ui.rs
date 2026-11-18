@@ -1,4 +1,6 @@
+mod agent_setup;
 use crate::{
+    agent::{self, Brand, Identity, InboxWorker, Mark, Session},
     git::{StatusMonitor, Statuses},
     refs,
     store::{self, Entry},
@@ -9,8 +11,8 @@ use crate::{
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, Event, KeyCode as K, KeyEventKind, KeyModifiers, MouseEvent,
-        MouseEventKind,
+        self, DisableMouseCapture, Event, KeyCode as K, KeyEventKind, KeyModifiers, MouseButton,
+        MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -46,6 +48,7 @@ struct Position {
     body: bool,
     diff: bool,
     revision: Option<String>,
+    session: Option<i64>,
 }
 enum Panel {
     Main,
@@ -54,6 +57,10 @@ enum Panel {
     Projects,
     Ignore,
     Links,
+    Sessions,
+    AgentSetup,
+    AgentCustom,
+    AgentHook,
     Git,
     Add,
 }
@@ -106,6 +113,7 @@ struct ViewKey {
     query: String,
     mode: usize,
     diff: bool,
+    session: Option<i64>,
 }
 
 impl ViewKey {
@@ -117,6 +125,7 @@ impl ViewKey {
             query: pos.query.clone(),
             mode: pos.mode,
             diff: pos.diff,
+            session: pos.session,
         }
     }
 }
@@ -167,12 +176,99 @@ struct Bookmark {
     options: Vec<String>,
     targets: Vec<refs::Target>,
 }
+struct Activity {
+    inbox: InboxWorker,
+    brands: std::collections::HashMap<String, Brand>,
+    focus: Option<agent::Focus>,
+    setup: Option<agent_setup::AgentSetup>,
+    sessions: Vec<Session>,
+    marks: std::collections::HashMap<i64, Mark>,
+    inspected: Vec<i64>,
+    task: Option<QueryTask<ActivityResult>>,
+    refresh: bool,
+    expiry: Option<i64>,
+    ascii: bool,
+}
+
+struct ActivityResult {
+    sessions: Vec<Session>,
+    marks: std::collections::HashMap<i64, Mark>,
+    inspected: Vec<i64>,
+}
+
+impl Activity {
+    fn start(focus: Option<agent::Focus>) -> Self {
+        Self {
+            inbox: InboxWorker::start(),
+            brands: agent::brands(),
+            focus,
+            setup: None,
+            sessions: Vec::new(),
+            marks: Default::default(),
+            inspected: Vec::new(),
+            task: None,
+            refresh: true,
+            expiry: None,
+            ascii: std::env::var_os("TT_ASCII").is_some(),
+        }
+    }
+
+    fn follows(&self, tool: &str) -> bool {
+        self.focus.as_ref().is_none_or(|focus| focus.follows(tool))
+    }
+
+    fn brand(&self, tool: &str) -> Option<&Brand> {
+        self.focus
+            .as_ref()
+            .and_then(|focus| focus.custom.get(tool))
+            .or_else(|| self.brands.get(tool))
+    }
+
+    fn badge(&self, identity: &Identity) -> (String, Style) {
+        self.tool_badge(self.brand(&identity.tool))
+    }
+
+    fn tool_badge(&self, brand: Option<&Brand>) -> (String, Style) {
+        let icon = brand
+            .map(|b| {
+                if self.ascii {
+                    b.ascii.as_deref().unwrap_or("*")
+                } else {
+                    &b.icon
+                }
+            })
+            .filter(|icon| !icon.is_empty())
+            .unwrap_or(if self.ascii { "*" } else { "●" });
+        let color = brand
+            .and_then(|b| b.color.strip_prefix('#'))
+            .filter(|hex| hex.len() == 6)
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            .map(|rgb| Color::Rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8))
+            .unwrap_or(ACC);
+        (terminal_text(icon), Style::new().fg(color))
+    }
+
+    fn name<'a>(&'a self, identity: &'a Identity) -> &'a str {
+        self.brand(&identity.tool)
+            .map_or(&identity.tool, |brand| &brand.name)
+    }
+
+    fn mark<'a>(&'a self, entry: &'a Entry) -> Option<&'a Mark> {
+        if self.inspected.binary_search(&entry.id).is_ok() {
+            self.marks.get(&entry.id)
+        } else {
+            entry.agent.as_ref()
+        }
+    }
+}
+
 struct App {
     db: Connection,
     root: String,
     worker: watch::Worker,
     git_monitor: StatusMonitor,
     git_status: Option<Statuses>,
+    activity: Activity,
     status: String,
     pos: Position,
     list: Vec<Entry>,
@@ -205,7 +301,7 @@ impl ViewQuery {
         let area = Rect::new(0, 0, size.width, size.height);
         let width = reader_panes(screen_bands(area, 0)[1], true)[1].width;
         let task = QueryTask::start(move |db, cancelled| {
-            let mut list = store::entries(db, &root, recent, &pos.only, &pos.query, pos.mode, 0)?;
+            let mut list = store::entries(db, pos.entry_query(&root))?;
             let raw_count = list.len();
             let groups = fold_page(&mut list, &pos);
             pos.entry = list.first().cloned();
@@ -246,6 +342,8 @@ fn fold_page(list: &mut Vec<Entry>, pos: &Position) -> Groups {
             && last.kind == "M"
             && entry.kind == "M"
             && last.path == entry.path
+            && last.agent == entry.agent
+            && last.agent != Some(Mark::Ambiguous)
             && previous - entry.stamp <= 60
         {
             let group = groups.entry(last.id).or_insert((last.id, 1));
@@ -263,6 +361,17 @@ fn fold_page(list: &mut Vec<Entry>, pos: &Position) -> Groups {
 }
 
 impl Position {
+    fn entry_query<'a>(&'a self, root: &'a str) -> store::EntryQuery<'a> {
+        store::EntryQuery {
+            root,
+            recent: self.recent,
+            only: &self.only,
+            text: &self.query,
+            mode: self.mode,
+            offset: self.offset,
+            session: self.session,
+        }
+    }
     fn anchor_row(&mut self, row: usize) {
         self.line = TextPoint::at_row(row);
         self.top = TextPoint::at_row(row.saturating_sub(3));
@@ -371,6 +480,98 @@ impl Preview {
 }
 
 impl App {
+    fn agent_tick(&mut self) {
+        let now = chrono::Utc::now().timestamp_millis();
+        if self.activity.expiry.is_some_and(|expiry| expiry <= now) {
+            self.activity.expiry = None;
+            self.activity.refresh = true;
+        }
+        if self.activity.inbox.updates.try_recv().is_ok() {
+            self.activity.refresh = true;
+            self.views.epoch = self.views.epoch.wrapping_add(1);
+            if self.pos.session.is_some() {
+                self.views.refresh_due = true;
+                self.pending = true;
+            }
+        }
+        if let Some(result) = self
+            .activity
+            .task
+            .as_ref()
+            .and_then(|task| task.results.try_recv().ok())
+        {
+            self.activity.task = None;
+            if let Ok(state) = result {
+                let selected = self
+                    .activity
+                    .sessions
+                    .get(self.choice)
+                    .map(|s| s.identity.id);
+                self.activity.expiry = state
+                    .sessions
+                    .iter()
+                    .flat_map(|session| {
+                        std::iter::once(session.last_seen + agent::ACTIVITY_MS + 1)
+                            .chain(
+                                session
+                                    .writing
+                                    .iter()
+                                    .map(|(_, at)| at + agent::ACTIVITY_MS),
+                            )
+                            .chain(session.last_write.map(|at| at + 60_000))
+                    })
+                    .filter(|&expiry| expiry > now)
+                    .min();
+                self.activity.sessions = state.sessions;
+                self.activity.marks = state.marks;
+                self.activity.inspected = state.inspected;
+                if matches!(self.panel, Panel::Sessions) {
+                    self.options = vec![String::new(); self.activity.sessions.len()];
+                    self.choice = selected
+                        .and_then(|id| {
+                            self.activity
+                                .sessions
+                                .iter()
+                                .position(|s| s.identity.id == id)
+                        })
+                        .unwrap_or(self.choice.min(self.options.len().saturating_sub(1)));
+                } else if matches!(self.panel, Panel::AgentSetup) {
+                    let selected = self.options.get(self.choice).cloned();
+                    self.setup_options(selected.as_deref());
+                }
+                self.dirty = true;
+            }
+        }
+        if self.activity.refresh && self.activity.task.is_none() {
+            self.activity.refresh = false;
+            let root = self.root.clone();
+            let mut inspected: Vec<_> = self.list.iter().map(|entry| entry.id).collect();
+            inspected.extend(self.pos.entry.iter().map(|entry| entry.id));
+            inspected.sort_unstable();
+            inspected.dedup();
+            self.activity.task = Some(QueryTask::start(move |db, _| {
+                Ok(ActivityResult {
+                    sessions: agent::sessions(db, &root)?,
+                    marks: agent::marks(db, &inspected)?,
+                    inspected,
+                })
+            }));
+        }
+    }
+
+    fn activity_visible(&self) -> bool {
+        !self.activity.sessions.is_empty() && matches!(self.panel, Panel::Main | Panel::Search)
+    }
+
+    fn attribution<'a>(&'a self, entry: &'a Entry) -> Option<&'a Mark> {
+        let mark = self.activity.mark(entry);
+        if self.groups.contains_key(&entry.id) && mark != entry.agent.as_ref() {
+            Some(&Mark::Ambiguous)
+        } else {
+            mark
+        }
+    }
+
     fn apply_page(&mut self, mut page: ViewPage, epoch: u64) {
         page.pos.body = self.pos.body;
         self.pos = page.pos;
@@ -379,6 +580,7 @@ impl App {
         self.raw_count = page.raw_count;
         self.preview = page.preview;
         self.views.active_epoch = Some(epoch);
+        self.activity.refresh = true;
         self.dirty = true;
     }
 
@@ -539,16 +741,9 @@ impl App {
         self.views.refresh = None;
         self.views.refresh_due = false;
         self.views.active_epoch = Some(self.views.epoch);
-        self.list = store::entries(
-            &self.db,
-            &self.root,
-            self.pos.recent,
-            &self.pos.only,
-            &self.pos.query,
-            self.pos.mode,
-            self.pos.offset,
-        )?;
+        self.list = store::entries(&self.db, self.pos.entry_query(&self.root))?;
         self.group_page();
+        self.activity.refresh = true;
         if !keep || self.pos.entry.is_none() {
             self.pos.entry = self.list.first().cloned();
             self.load(true)?;
@@ -562,6 +757,11 @@ impl App {
 
     fn load(&mut self, locate: bool) -> Result<()> {
         self.preview = Preview::prepare(&self.db, &self.root, &mut self.pos, &self.groups, locate)?;
+        if let Some(entry) = &self.pos.entry
+            && self.activity.inspected.binary_search(&entry.id).is_err()
+        {
+            self.activity.refresh = true;
+        }
         Ok(())
     }
 
@@ -681,9 +881,18 @@ impl App {
             self.choice = bookmark.choice;
             self.list = bookmark.list;
             self.groups = bookmark.groups;
+            self.activity.refresh = true;
             self.raw_count = bookmark.count;
             self.options = bookmark.options;
             self.targets = bookmark.targets;
+            if let Some(id) = self.pos.session
+                && let Some(tool) = agent::session_tool(&self.db, id)?
+                && !self.activity.follows(&tool)
+            {
+                self.pos.session = None;
+                self.pos.offset = 0;
+                return self.reload(false);
+            }
             self.load(false)?;
         } else {
             self.panel = Panel::Main;
@@ -769,6 +978,13 @@ impl App {
         self.positions.insert(self.root.clone(), self.pos.clone());
         self.root = r;
         self.views = ViewSwitch::default();
+        self.activity.task = None;
+        self.activity.focus = agent::focus(&self.db, &self.root)?;
+        self.activity.setup = None;
+        self.activity.sessions.clear();
+        self.activity.marks.clear();
+        self.activity.inspected.clear();
+        self.activity.refresh = true;
         self.db.execute(
             "INSERT OR REPLACE INTO projects VALUES(?,?)",
             params![self.root, chrono::Local::now().timestamp_millis()],
@@ -799,14 +1015,13 @@ impl App {
             let root = self.root.clone();
             let pos = self.pos.clone();
             self.search = Some(QueryTask::start(move |db, _| {
-                store::entries(
-                    db, &root, pos.recent, &pos.only, &pos.query, pos.mode, pos.offset,
-                )
+                store::entries(db, pos.entry_query(&root))
             }));
         }
         if let Some(result) = self.search.as_ref().and_then(|s| s.results.try_recv().ok()) {
             self.search = None;
             self.list = result?;
+            self.activity.refresh = true;
             self.views.active_epoch = Some(self.views.epoch);
             self.group_page();
             self.pos.entry = self.list.first().cloned();
@@ -861,13 +1076,19 @@ impl App {
     }
 
     fn mouse(&mut self, event: MouseEvent, area: Rect) -> Result<bool> {
+        let pointer = ratatui::layout::Position::new(event.column, event.row);
+        let [_, content, _] = screen_bands(
+            area,
+            self.path_lines(area).len() + usize::from(self.activity_visible()),
+        );
         let forward = match event.kind {
+            MouseEventKind::Down(MouseButton::Left) if matches!(self.panel, Panel::AgentSetup) => {
+                return Ok(self.setup_click(pointer, content));
+            }
             MouseEventKind::ScrollDown => true,
             MouseEventKind::ScrollUp => false,
             _ => return Ok(false),
         };
-        let pointer = ratatui::layout::Position::new(event.column, event.row);
-        let [_, content, _] = screen_bands(area, self.path_lines(area).len());
         let moved = match self.panel {
             Panel::Main | Panel::Search => {
                 let [events, body] = reader_panes(content, self.pos.body);
@@ -881,7 +1102,7 @@ impl App {
                     false
                 }
             }
-            Panel::Add => false,
+            Panel::Add | Panel::AgentHook | Panel::AgentCustom => false,
             _ => {
                 let list = if matches!(self.panel, Panel::Links) && !self.targets.is_empty() {
                     link_panes(content)[0]
@@ -905,11 +1126,25 @@ impl App {
         }
         self.notice = None;
         let area = Rect::new(0, 0, size.width, size.height);
-        let [_, content, _] = screen_bands(area, self.path_lines(area).len());
+        let [_, content, _] = screen_bands(
+            area,
+            self.path_lines(area).len() + usize::from(self.activity_visible()),
+        );
         let reader = reader_panes(content, true)[1];
         let page = reader.height.saturating_sub(2).max(1) as usize;
         let narrow = size.width < 80;
         self.follow = false;
+        if matches!(
+            self.panel,
+            Panel::AgentSetup | Panel::AgentCustom | Panel::AgentHook
+        ) {
+            self.setup_key(k)?;
+            return Ok(false);
+        }
+        if matches!(self.panel, Panel::Sessions) && k == K::Char('c') {
+            self.open_agent_setup(true);
+            return Ok(false);
+        }
         if matches!(self.panel, Panel::Add) {
             match k {
                 K::Esc => self.back()?,
@@ -1000,6 +1235,20 @@ impl App {
                             .unwrap_or(0);
                         self.pos.anchor_row(row);
                     }
+                    Panel::Sessions => {
+                        let selected = self.activity.sessions[self.choice].identity.id;
+                        self.back()?;
+                        self.push();
+                        self.pos.session = Some(selected);
+                        self.pos.recent = false;
+                        self.pos.only.clear();
+                        self.pos.query.clear();
+                        self.pos.mode = 0;
+                        self.pos.offset = 0;
+                        self.pos.revision = None;
+                        self.pos.body = false;
+                        self.reload(false)?
+                    }
                     Panel::Ignore => {
                         store::update_rule(
                             &mut self.db,
@@ -1031,7 +1280,7 @@ impl App {
                     "z  折叠连续保存     f  当前目录     H  回到起点".into(),
                     "d  切换对比     h  文件历史".into(),
                     "r  查引用与定义 · 正文里先用 ↑↓ 选一行".into(),
-                    "i  忽略规则".into(),
+                    "a  AI 会话与变更筛选     i  忽略规则".into(),
                     "t  时间轴 / 最近文件     g  最新".into(),
                     "G  Git 历史     /  搜索     p  项目     q  退出".into(),
                     "Git 两格状态  暂存区 / 工作区，?? 未跟踪".into(),
@@ -1045,6 +1294,14 @@ impl App {
                 self.pos.offset = 0;
                 self.pos.body = false;
                 self.reload(false)?
+            }
+            K::Char('a') => {
+                self.push();
+                if self.activity.focus.is_none() {
+                    self.open_agent_setup(false);
+                } else {
+                    self.open_agent_sessions();
+                }
             }
             K::Char('p') => {
                 self.push();
@@ -1168,7 +1425,7 @@ impl App {
 
     fn draw(&mut self, f: &mut Frame) {
         let path = self.path_lines(f.area());
-        let bands = screen_bands(f.area(), path.len());
+        let bands = screen_bands(f.area(), path.len() + usize::from(self.activity_visible()));
         let name = std::path::Path::new(&self.root)
             .file_name()
             .unwrap_or_default()
@@ -1201,7 +1458,67 @@ impl App {
             ));
         }
         heading.extend(path.into_iter().map(Line::raw));
+        if self.activity_visible() {
+            let now = chrono::Utc::now().timestamp_millis();
+            let mut row = vec![Span::styled("AI  ", Style::new().fg(DIM))];
+            let ordered = self
+                .activity
+                .sessions
+                .iter()
+                .filter(|s| s.current_write(now).is_some())
+                .chain(
+                    self.activity
+                        .sessions
+                        .iter()
+                        .filter(|s| s.current_write(now).is_none()),
+                );
+            for session in ordered.take(2) {
+                let (icon, style) = self.activity.badge(&session.identity);
+                row.push(Span::styled(
+                    format!(
+                        "{icon} {} {} ",
+                        terminal_text(self.activity.name(&session.identity)),
+                        session.identity.short()
+                    ),
+                    style,
+                ));
+                let state = if let Some(path) = session.current_write(now) {
+                    format!("准备写入 {}", compact_path(&terminal_text(path), 24))
+                } else if session
+                    .last_write
+                    .is_some_and(|at| now.saturating_sub(at) < 60_000)
+                {
+                    "刚有写入".into()
+                } else {
+                    session.status(now).to_string()
+                };
+                row.push(Span::raw(format!("{state}   ")));
+            }
+            row.push(Span::styled("a 会话", Style::new().fg(DIM)));
+            heading.push(Line::from(row));
+        }
+        if matches!(self.panel, Panel::Sessions)
+            && let Some(session) = self.activity.sessions.get(self.choice)
+        {
+            heading.push(Line::styled(
+                format!("会话 {}", terminal_text(&session.identity.external_id)),
+                Style::new().fg(DIM),
+            ));
+        }
+        if matches!(self.panel, Panel::AgentSetup) {
+            heading.push(Line::styled(
+                "选中的工具会显示在会话视图中 · h 查看接入方式",
+                Style::new().fg(DIM),
+            ));
+        }
         f.render_widget(Paragraph::new(heading), bands[0]);
+        if matches!(
+            self.panel,
+            Panel::AgentSetup | Panel::AgentCustom | Panel::AgentHook
+        ) {
+            self.draw_agent_setup(f, bands);
+            return;
+        }
         let main = matches!(self.panel, Panel::Main | Panel::Search);
         if main {
             let [events, body] = reader_panes(bands[1], self.pos.body);
@@ -1218,7 +1535,7 @@ impl App {
                     .saturating_sub(h / 2)
                     .min(self.list.len().saturating_sub(h));
                 let today = chrono::Local::now().date_naive();
-                let lines = self
+                let mut lines = self
                     .list
                     .iter()
                     .enumerate()
@@ -1251,8 +1568,28 @@ impl App {
                             .and_then(|statuses| statuses.get(&e.path))
                             .copied();
                         let status_width = if git.is_some() { 3 } else { 0 };
-                        let width = (a.width as usize)
-                            .saturating_sub(prefix.width() + count.width() + status_width);
+                        let badge = match self.attribution(e) {
+                            Some(Mark::Linked(identity))
+                                if self.activity.follows(&identity.tool) =>
+                            {
+                                let (mut icon, style) = self.activity.badge(identity);
+                                if a.width >= 36 {
+                                    icon.push_str(&format!(" {}", identity.short()));
+                                }
+                                Some((format!(" {icon}"), style))
+                            }
+                            Some(Mark::Possible(identity))
+                                if self.activity.follows(&identity.tool) =>
+                            {
+                                Some((" ?".into(), Style::new().fg(DIM)))
+                            }
+                            Some(Mark::Ambiguous) => Some((" ?".into(), Style::new().fg(DIM))),
+                            _ => None,
+                        };
+                        let badge_width = badge.as_ref().map_or(0, |(text, _)| text.width());
+                        let width = (a.width as usize).saturating_sub(
+                            prefix.width() + count.width() + status_width + badge_width,
+                        );
                         let display = compact_path(&terminal_text(&e.path), width);
                         let mut spans = vec![Span::raw(prefix)];
                         let mut path_style = Style::default();
@@ -1275,6 +1612,9 @@ impl App {
                         }
                         spans.push(Span::styled(display, path_style));
                         spans.push(Span::raw(count));
+                        if let Some((text, style)) = badge {
+                            spans.push(Span::styled(text, style));
+                        }
                         let selected = if i == index {
                             Style::new().fg(ACC).bold()
                         } else {
@@ -1283,6 +1623,9 @@ impl App {
                         Line::from(spans).style(selected)
                     })
                     .collect::<Vec<_>>();
+                if lines.is_empty() && self.pos.session.is_some() {
+                    lines.push(Line::styled("暂无已关联变更", Style::new().fg(DIM)));
+                }
                 let mut title = if !self.pos.query.is_empty() {
                     format!("搜索 · {}", self.pos.query)
                 } else if !self.pos.only.is_empty() {
@@ -1292,6 +1635,13 @@ impl App {
                 } else {
                     "时间轴".into()
                 };
+                if let Some(id) = self.pos.session
+                    && let Some(session) =
+                        self.activity.sessions.iter().find(|s| s.identity.id == id)
+                {
+                    let (icon, _) = self.activity.badge(&session.identity);
+                    title.push_str(&format!(" · {icon} {}", session.identity.short()));
+                }
                 if self.git_status.is_some() {
                     title.push_str(" · Git");
                 }
@@ -1339,6 +1689,29 @@ impl App {
                     ));
                 } else if let Some(note) = self.preview.comparison_note {
                     summary.push_str(&format!("  ·  {note}"));
+                }
+                if let Some(entry) = &self.pos.entry {
+                    match self.attribution(entry) {
+                        Some(Mark::Linked(identity)) | Some(Mark::Possible(identity)) => {
+                            let (icon, _) = self.activity.badge(identity);
+                            let evidence =
+                                if matches!(self.attribution(entry), Some(Mark::Linked(_))) {
+                                    "写入已关联"
+                                } else {
+                                    "可能相关"
+                                };
+                            summary.push_str(&format!(
+                                "  ·  {icon} {} {} {evidence}",
+                                terminal_text(self.activity.name(identity)),
+                                identity.short()
+                            ));
+                        }
+                        Some(Mark::Ambiguous) => summary.push_str("  ·  归属不明"),
+                        None if entry.kind != "B" && self.preview.source.is_empty() => {
+                            summary.push_str("  ·  来源未知");
+                        }
+                        None => {}
+                    }
                 }
                 if let Some(local) = self
                     .pos
@@ -1424,6 +1797,7 @@ impl App {
                 Panel::Projects => "项目",
                 Panel::Ignore => "选择忽略规则",
                 Panel::Links => "引用与定义 · 当前索引",
+                Panel::Sessions => "AI 会话 · 当前目录",
                 _ => "",
             };
             let target = if matches!(self.panel, Panel::Links) {
@@ -1447,6 +1821,46 @@ impl App {
                 )
                 .take(list_area.height.saturating_sub(1) as usize)
             {
+                if matches!(self.panel, Panel::Sessions)
+                    && let Some(session) = self.activity.sessions.get(i)
+                {
+                    let now = chrono::Utc::now().timestamp_millis();
+                    let (icon, style) = self.activity.badge(&session.identity);
+                    let marker = if i == self.choice { "› " } else { "  " };
+                    let time = chrono::DateTime::from_timestamp_millis(session.last_seen)
+                        .map(|t| {
+                            t.with_timezone(&chrono::Local)
+                                .format("%m-%d %H:%M")
+                                .to_string()
+                        })
+                        .unwrap_or_default();
+                    let details = [session.title.as_deref(), session.model.as_deref()]
+                        .into_iter()
+                        .flatten()
+                        .map(terminal_text)
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                    let status = session
+                        .current_write(now)
+                        .map(|path| format!("准备写入 {}", terminal_text(path)))
+                        .unwrap_or_else(|| session.status(now).to_string());
+                    lines.push(Line::from(vec![
+                        Span::styled(marker, Style::new().fg(ACC)),
+                        Span::styled(
+                            format!(
+                                "{icon} {} {} ",
+                                terminal_text(self.activity.name(&session.identity)),
+                                session.identity.short()
+                            ),
+                            style,
+                        ),
+                        Span::raw(format!(
+                            "  {status}  ·  {} 个文件  ·  {time}  {details}",
+                            session.files
+                        )),
+                    ]));
+                    continue;
+                }
                 let text = if matches!(self.panel, Panel::Links)
                     && let Some(candidate) = self.targets.get(i)
                 {
@@ -1484,6 +1898,8 @@ impl App {
                             .as_deref()
                             .unwrap_or("没有找到引用或定义候选")
                     }
+                } else if matches!(self.panel, Panel::Sessions) {
+                    "暂无关注工具的会话 · c 修改关注或查看 Hook"
                 } else {
                     "暂无匹配"
                 };
@@ -1542,6 +1958,8 @@ impl App {
             } else {
                 "↑↓ 预览   Enter 跳转   Esc 返回".into()
             }
+        } else if matches!(self.panel, Panel::Sessions) {
+            "↑↓ 选会话  Enter 筛选  c 修改关注  Esc 返回".into()
         } else if !main {
             "↑↓ 选择   Enter 确定   Esc 返回".into()
         } else if let Some(notice) = self.notice {
@@ -1552,7 +1970,7 @@ impl App {
                 if self.pos.diff { "正文" } else { "对比" }
             )
         } else {
-            "↑↓ 事件  Enter 阅读  r 引用  [ / ] 变化  d 对比  / 搜索".into()
+            "↑↓ 事件  Enter 阅读  a 会话  r 引用  [ / ] 变化  d 对比  / 搜索".into()
         };
         f.render_widget(Paragraph::new(hint).style(Style::new().fg(ACC)), bands[2]);
     }
@@ -1757,12 +2175,14 @@ pub fn run(db: Connection, root: String) -> Result<()> {
         Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let worker = watch::start(root.clone());
     let git_monitor = StatusMonitor::start(root.clone());
+    let focus = agent::focus(&db, &root)?;
     let mut a = App {
         db,
         root,
         worker,
         git_monitor,
         git_status: None,
+        activity: Activity::start(focus),
         status: "建立基线".into(),
         pos: Position::default(),
         list: vec![],
@@ -1804,6 +2224,7 @@ pub fn run(db: Connection, root: String) -> Result<()> {
                 a.git_monitor.refresh();
             }
             a.status = s;
+            a.activity.refresh = true;
             a.views.epoch = a.views.epoch.wrapping_add(1);
             a.views.failed = None;
             if a.follow || a.pos.entry.is_none() {
@@ -1814,13 +2235,14 @@ pub fn run(db: Connection, root: String) -> Result<()> {
             a.dirty = true;
         }
         a.view_tick(size);
+        a.agent_tick();
         if a.dirty {
             term.draw(|f| a.draw(f))?;
             a.dirty = false;
         }
         let poll_ms = if a.views.transition.is_some() || a.views.wanted {
             24
-        } else if a.references.is_some() || a.views.refresh.is_some() {
+        } else if a.references.is_some() || a.views.refresh.is_some() || a.activity.task.is_some() {
             35
         } else {
             250
@@ -1838,7 +2260,9 @@ pub fn run(db: Connection, root: String) -> Result<()> {
                 Event::Mouse(event)
                     if matches!(
                         event.kind,
-                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                        MouseEventKind::ScrollUp
+                            | MouseEventKind::ScrollDown
+                            | MouseEventKind::Down(MouseButton::Left)
                     ) =>
                 {
                     a.dirty |= a.mouse(event, Rect::new(0, 0, size.width, size.height))?;

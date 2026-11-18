@@ -310,6 +310,7 @@ pub fn links(
                     path: p.into(),
                     kind: r.get(1)?,
                     stamp: r.get(2)?,
+                    agent: None,
                 },
                 line: n,
                 label,

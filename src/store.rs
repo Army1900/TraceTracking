@@ -48,6 +48,7 @@ fn schema(db: Connection) -> Result<Connection> {
  CREATE INDEX IF NOT EXISTS symbol_names ON symbols(kind,name);
  CREATE INDEX IF NOT EXISTS revisions ON events(new);
  CREATE TABLE IF NOT EXISTS hooks(root TEXT,path TEXT,hash TEXT,source TEXT,stamp INTEGER);")?;
+    crate::agent::schema(&db)?;
     Ok(db)
 }
 pub fn strings(db: &Connection, sql: &str, args: impl rusqlite::Params) -> Result<Vec<String>> {
@@ -245,10 +246,14 @@ fn save(
             source.unwrap_or_default()
         ],
     )?;
+    let event_id = tx.last_insert_rowid();
+    if matches!(kind, "A" | "M" | "D") {
+        crate::agent::match_observed(&tx, root, p, event_id)?;
+    }
     if new.is_some() {
         tx.execute(
             "INSERT OR REPLACE INTO files VALUES(?,?,?)",
-            params![root, p, tx.last_insert_rowid()],
+            params![root, p, event_id],
         )?;
     } else {
         tx.execute(
@@ -265,16 +270,29 @@ pub struct Entry {
     pub path: String,
     pub kind: String,
     pub stamp: i64,
+    pub agent: Option<crate::agent::Mark>,
 }
-pub fn entries(
-    db: &Connection,
-    root: &str,
-    recent: bool,
-    only: &str,
-    query: &str,
-    mode: usize,
-    offset: usize,
-) -> Result<Vec<Entry>> {
+#[derive(Default)]
+pub struct EntryQuery<'a> {
+    pub root: &'a str,
+    pub recent: bool,
+    pub only: &'a str,
+    pub text: &'a str,
+    pub mode: usize,
+    pub offset: usize,
+    pub session: Option<i64>,
+}
+
+pub fn entries(db: &Connection, query: EntryQuery<'_>) -> Result<Vec<Entry>> {
+    let EntryQuery {
+        root,
+        recent,
+        only,
+        text,
+        mode,
+        offset,
+        session,
+    } = query;
     let filter = rules(db, root)?;
     let base = PathBuf::from(root);
     db.create_scalar_function(
@@ -312,7 +330,7 @@ pub fn entries(
             .any(|r| r.mark != ' ' && r.text.contains(&q)))
         },
     )?;
-    let table = if recent || mode == 1 {
+    let table = if (recent || mode == 1) && session.is_none() {
         "files f JOIN events e ON f.id=e.id"
     } else {
         "events e"
@@ -324,21 +342,42 @@ pub fn entries(
         }
         _ => "instr(lower(e.path),lower(?3))>0",
     };
+    let session_filter = crate::agent::session_condition();
+    let recent_filter = if recent && session.is_some() {
+        format!(
+            "AND NOT EXISTS (SELECT 1 FROM events newer
+           WHERE newer.root=e.root AND newer.path=e.path AND newer.id>e.id
+             AND EXISTS(SELECT 1 FROM events e WHERE e.id=newer.id AND {session_filter}))"
+        )
+    } else {
+        String::new()
+    };
     let sql = format!(
-        "SELECT e.id,e.path,e.kind,e.stamp FROM {table} WHERE e.root=?1 AND (?2='' OR e.path=?2 OR (substr(?2,-1)='/' AND instr(e.path,?2)=1)) AND {pred} AND visible_path(e.path) ORDER BY e.stamp DESC,e.id DESC LIMIT 256 OFFSET ?4"
+        "SELECT e.id,e.path,e.kind,e.stamp FROM {table}
+         WHERE e.root=?1 AND (?2='' OR e.path=?2 OR (substr(?2,-1)='/' AND instr(e.path,?2)=1))
+           AND {pred} AND visible_path(e.path) AND (?5 IS NULL OR {session_filter}) {recent_filter}
+         ORDER BY e.stamp DESC,e.id DESC LIMIT 256 OFFSET ?4"
     );
-    Ok(db
+    let mut entries = db
         .prepare(&sql)?
-        .query_map(params![root, only, query, offset], |r| {
+        .query_map(params![root, only, text, offset, session], |r| {
             Ok(Entry {
                 id: r.get(0)?,
                 path: r.get(1)?,
                 kind: r.get(2)?,
                 stamp: r.get(3)?,
+                agent: None,
             })
         })?
-        .collect::<rusqlite::Result<_>>()?)
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let ids: Vec<_> = entries.iter().map(|event| event.id).collect();
+    let mut marks = crate::agent::marks(db, &ids)?;
+    for event in &mut entries {
+        event.agent = marks.remove(&event.id);
+    }
+    Ok(entries)
 }
+
 pub fn bodies(db: &Connection, id: i64) -> Result<(Option<String>, Option<String>, String)> {
     Ok(db.query_row("SELECT a.body,b.body,e.source FROM events e LEFT JOIN blobs a ON a.hash=e.old LEFT JOIN blobs b ON b.hash=e.new WHERE e.id=?",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?)
 }
@@ -454,14 +493,32 @@ mod tests {
         assert_eq!(links[0].event.path, "config.yaml");
         fs::write(dir.join("config.yaml"), "count: 2")?;
         scan(&mut db, root, &dir.join("config.yaml"), &filter, false)?;
-        let e = entries(&db, root, false, "config.yaml", "", 0, 0)?;
+        let e = entries(
+            &db,
+            EntryQuery {
+                root,
+                only: "config.yaml",
+                ..Default::default()
+            },
+        )?;
         assert_eq!(e[0].kind, "M");
         let (a, b, _) = bodies(&db, e[0].id)?;
         assert_eq!(a.as_deref(), Some("count: 1"));
         assert_eq!(b.as_deref(), Some("count: 2"));
         fs::remove_file(&path)?;
         scan(&mut db, root, &path, &filter, false)?;
-        assert_eq!(entries(&db, root, false, "note.md", "", 0, 0)?[0].kind, "D");
+        assert_eq!(
+            entries(
+                &db,
+                EntryQuery {
+                    root,
+                    only: "note.md",
+                    ..Default::default()
+                }
+            )?[0]
+                .kind,
+            "D"
+        );
         fs::remove_dir_all(dir)?;
         Ok(())
     }
