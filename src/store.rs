@@ -24,6 +24,12 @@ pub fn database() -> Result<Connection> {
     let db = Connection::open(dir.join("history.sqlite3"))?;
     schema(db)
 }
+pub fn read_only() -> Result<Connection> {
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY;
+    let db = Connection::open_with_flags(data_dir()?.join("history.sqlite3"), flags)?;
+    db.busy_timeout(Duration::from_secs(3))?;
+    Ok(db)
+}
 fn schema(db: Connection) -> Result<Connection> {
     db.busy_timeout(Duration::from_secs(10))?;
     db.execute_batch("PRAGMA journal_mode=WAL;
@@ -443,7 +449,8 @@ mod tests {
         let mut db = db;
         let filter = rules(&db, root)?;
         scan(&mut db, root, &dir, &filter, true)?;
-        let links = crate::refs::links(&db, root, "note.md", "[settings](config.yaml)", 0)?;
+        let links =
+            crate::refs::links(&db, root, "note.md", "[settings](config.yaml)", 0, || false)?;
         assert_eq!(links[0].event.path, "config.yaml");
         fs::write(dir.join("config.yaml"), "count: 2")?;
         scan(&mut db, root, &dir.join("config.yaml"), &filter, false)?;

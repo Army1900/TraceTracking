@@ -1,13 +1,16 @@
 use crate::{
     refs,
     store::{self, Entry},
-    syntax::Syntax,
+    syntax::{Syntax, terminal_text},
     view::{self, Row},
     watch,
 };
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode as K, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, Event, KeyCode as K, KeyEventKind, KeyModifiers, MouseEvent,
+        MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -18,8 +21,14 @@ use ratatui::{
 use rusqlite::{Connection, params};
 use std::{
     io::{self, Stdout},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::Duration,
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const ACC: Color = Color::Rgb(110, 199, 178);
 const DIM: Color = Color::DarkGray;
 #[derive(Clone, Default)]
@@ -47,14 +56,31 @@ enum Panel {
     Git,
     Add,
 }
-struct SearchTask {
-    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    results: std::sync::mpsc::Receiver<Result<Vec<Entry>>>,
+struct QueryTask<T> {
+    cancel: Arc<AtomicBool>,
+    results: mpsc::Receiver<Result<T>>,
 }
-impl Drop for SearchTask {
+
+impl<T: Send + 'static> QueryTask<T> {
+    fn start(query: impl FnOnce(&Connection, &AtomicBool) -> Result<T> + Send + 'static) -> Self {
+        let (tx, results) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        std::thread::spawn(move || {
+            let result = store::read_only().and_then(|db| {
+                let progress = flag.clone();
+                db.progress_handler(500, Some(move || progress.load(Ordering::Relaxed)));
+                query(&db, &flag)
+            });
+            let _ = tx.send(result);
+        });
+        Self { cancel, results }
+    }
+}
+
+impl<T> Drop for QueryTask<T> {
     fn drop(&mut self) {
-        self.cancel
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.cancel.store(true, Ordering::Relaxed);
     }
 }
 struct Bookmark {
@@ -89,7 +115,9 @@ struct App {
     groups: std::collections::HashMap<i64, (i64, usize)>,
     raw_count: usize,
     positions: std::collections::HashMap<String, Position>,
-    search: Option<SearchTask>,
+    search: Option<QueryTask<Vec<Entry>>>,
+    references: Option<QueryTask<Vec<refs::Target>>>,
+    reference_error: Option<String>,
     search_after: Option<std::time::Instant>,
     input: String,
     follow: bool,
@@ -303,6 +331,8 @@ impl App {
         });
     }
     fn back(&mut self) -> Result<()> {
+        self.references = None;
+        self.reference_error = None;
         self.search = None;
         self.search_after = None;
         if let Some(bookmark) = self.stack.pop() {
@@ -322,22 +352,75 @@ impl App {
         Ok(())
     }
 
-    fn links(&mut self) -> Result<()> {
-        if let Some(e) = &self.pos.entry {
-            let (_, mut b, _) = store::bodies(&self.db, e.id)?;
-            if let Some(rev) = &self.pos.revision {
-                b = Some(crate::git::body(&self.root, &e.path, rev)?);
-            }
-            let n = self
-                .rows
-                .get(self.pos.line)
-                .map_or(0, |r| r.num.saturating_sub(1));
-            self.targets =
-                refs::links(&self.db, &self.root, &e.path, b.as_deref().unwrap_or(""), n)?;
-            self.options = self.targets.iter().map(|t| t.label.clone()).collect();
-        }
-        Ok(())
+    fn links(&mut self) {
+        let Some(entry) = self.pos.entry.clone() else {
+            return;
+        };
+        let root = self.root.clone();
+        let (line, removed) = self.rows.get(self.pos.line).map_or((0, false), |row| {
+            (row.num.saturating_sub(1), row.mark == '-')
+        });
+        let git = self
+            .pos
+            .revision
+            .clone()
+            .filter(|_| !self.pos.diff || removed);
+        let oldest = self.groups.get(&entry.id).map(|&(id, _)| id);
+        self.search = None;
+        self.search_after = None;
+        self.options.clear();
+        self.targets.clear();
+        self.reference_error = None;
+        self.references = Some(QueryTask::start(move |db, flag| {
+            let (previous, current, _) = store::bodies(db, entry.id)?;
+            let body = if let Some(rev) = git {
+                Some(crate::git::body(&root, &entry.path, &rev)?)
+            } else if removed && let Some(id) = oldest {
+                store::bodies(db, id)?.0
+            } else if removed {
+                previous
+            } else {
+                current.or(previous)
+            };
+            refs::links(
+                db,
+                &root,
+                &entry.path,
+                body.as_deref().unwrap_or(""),
+                line,
+                || flag.load(Ordering::Relaxed),
+            )
+        }));
     }
+
+    fn references_tick(&mut self) {
+        let Some(result) =
+            self.references
+                .as_ref()
+                .and_then(|task| match task.results.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(mpsc::TryRecvError::Empty) => None,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        Some(Err(anyhow::anyhow!("查询已中断")))
+                    }
+                })
+        else {
+            return;
+        };
+        self.references = None;
+        match result {
+            Ok(targets) => {
+                self.options = targets
+                    .iter()
+                    .map(|target| target.label.to_string())
+                    .collect();
+                self.targets = targets;
+            }
+            Err(error) => self.reference_error = Some(format!("引用查询失败 · {error}")),
+        }
+        self.dirty = true;
+    }
+
     fn switch(&mut self, r: String) -> Result<()> {
         self.positions.insert(self.root.clone(), self.pos.clone());
         self.root = r;
@@ -368,23 +451,11 @@ impl App {
             self.search_after = None;
             let root = self.root.clone();
             let pos = self.pos.clone();
-            let (tx, results) = std::sync::mpsc::channel();
-            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let flag = cancel.clone();
-            std::thread::spawn(move || {
-                let result = (|| {
-                    let db = store::database()?;
-                    db.progress_handler(
-                        500,
-                        Some(move || flag.load(std::sync::atomic::Ordering::Relaxed)),
-                    );
-                    store::entries(
-                        &db, &root, pos.recent, &pos.only, &pos.query, pos.mode, pos.offset,
-                    )
-                })();
-                let _ = tx.send(result);
-            });
-            self.search = Some(SearchTask { cancel, results });
+            self.search = Some(QueryTask::start(move |db, _| {
+                store::entries(
+                    db, &root, pos.recent, &pos.only, &pos.query, pos.mode, pos.offset,
+                )
+            }));
         }
         if let Some(result) = self.search.as_ref().and_then(|s| s.results.try_recv().ok()) {
             self.search = None;
@@ -396,9 +467,94 @@ impl App {
         }
         Ok(())
     }
+    fn move_entry(&mut self, forward: bool) -> Result<bool> {
+        if self.list.is_empty() {
+            return Ok(false);
+        }
+        let current = self.pos.entry.as_ref().map(|e| e.id);
+        let index = self
+            .list
+            .iter()
+            .position(|e| Some(e.id) == current)
+            .unwrap_or(0);
+        let old_offset = self.pos.offset;
+        let next = if forward && index + 1 == self.list.len() && self.raw_count == 256 {
+            self.pos.offset += 255;
+            self.reload(true)?;
+            usize::from(self.list.len() > 1)
+        } else if !forward && index == 0 && self.pos.offset > 0 {
+            self.pos.offset = self.pos.offset.saturating_sub(255);
+            self.reload(true)?;
+            self.list.len().saturating_sub(2)
+        } else if forward {
+            (index + 1).min(self.list.len() - 1)
+        } else {
+            index.saturating_sub(1)
+        };
+        let entry = self.list.get(next);
+        if old_offset == self.pos.offset && entry.map(|e| e.id) == current {
+            return Ok(false);
+        }
+        self.pos.entry = entry.cloned();
+        self.pos.revision = None;
+        self.load(true)?;
+        Ok(true)
+    }
+
+    fn move_choice(&mut self, forward: bool) -> bool {
+        let next = if forward {
+            (self.choice + 1).min(self.options.len().saturating_sub(1))
+        } else {
+            self.choice.saturating_sub(1)
+        };
+        let moved = next != self.choice;
+        self.choice = next;
+        moved
+    }
+
+    fn mouse(&mut self, event: MouseEvent, area: Rect) -> Result<bool> {
+        let forward = match event.kind {
+            MouseEventKind::ScrollDown => true,
+            MouseEventKind::ScrollUp => false,
+            _ => return Ok(false),
+        };
+        let pointer = ratatui::layout::Position::new(event.column, event.row);
+        let [_, content, _] = screen_bands(area, self.path_lines(area).len());
+        let moved = match self.panel {
+            Panel::Main | Panel::Search => {
+                let [events, body] = reader_panes(content, self.pos.body);
+                if body.contains(pointer) {
+                    let before = (self.pos.line, self.pos.top);
+                    self.scroll(forward, 3, body.height.saturating_sub(2) as usize);
+                    before != (self.pos.line, self.pos.top)
+                } else if events.contains(pointer) {
+                    self.move_entry(forward)?
+                } else {
+                    false
+                }
+            }
+            Panel::Add => false,
+            _ => {
+                let list = if matches!(self.panel, Panel::Links) && !self.targets.is_empty() {
+                    link_panes(content)[0]
+                } else {
+                    content
+                };
+                list.contains(pointer) && self.move_choice(forward)
+            }
+        };
+        if moved {
+            self.notice = None;
+            self.follow = false;
+        }
+        Ok(moved)
+    }
+
     fn key(&mut self, k: K, size: Size) -> Result<bool> {
         self.notice = None;
-        let page = size.height.saturating_sub(5).max(1) as usize;
+        let area = Rect::new(0, 0, size.width, size.height);
+        let [_, content, _] = screen_bands(area, self.path_lines(area).len());
+        let page = content.height.saturating_sub(2).max(1) as usize;
         let narrow = size.width < 80;
         self.follow = false;
         if matches!(self.panel, Panel::Add) {
@@ -444,9 +600,8 @@ impl App {
         if !matches!(self.panel, Panel::Main) {
             match k {
                 K::Esc | K::Char('q') => self.back()?,
-                K::Up => self.choice = self.choice.saturating_sub(1),
-                K::Down => {
-                    self.choice = (self.choice + 1).min(self.options.len().saturating_sub(1))
+                K::Up | K::Down => {
+                    self.move_choice(k == K::Down);
                 }
                 K::Enter if self.choice < self.options.len() => match self.panel {
                     Panel::Projects => {
@@ -512,9 +667,11 @@ impl App {
                     "↑↓  选择事件或正文行".into(),
                     "[ / ]  上一处 / 下一处变化".into(),
                     "PgUp / PgDn  正文翻页".into(),
+                    "滚轮  滚动鼠标所在的列表或正文".into(),
                     "z  折叠连续保存     f  当前目录     H  回到起点".into(),
                     "d  切换对比     h  文件历史".into(),
-                    "r  引用与定义     i  忽略规则".into(),
+                    "r  查引用与定义 · 正文里先用 ↑↓ 选一行".into(),
+                    "i  忽略规则".into(),
                     "t  时间轴 / 最近文件     g  最新".into(),
                     "G  Git 历史     /  搜索     p  项目     q  退出".into(),
                 ];
@@ -552,7 +709,7 @@ impl App {
                 self.push();
                 self.panel = Panel::Links;
                 self.choice = 0;
-                self.links()?
+                self.links()
             }
             K::Char('i') if self.pos.entry.is_some() => {
                 let p = self.pos.entry.as_ref().unwrap().path.clone();
@@ -631,73 +788,55 @@ impl App {
             }
             K::Up | K::Down if self.pos.body => self.scroll(k == K::Down, 1, page),
             K::Up | K::Down => {
-                let i = self
-                    .pos
-                    .entry
-                    .as_ref()
-                    .and_then(|e| self.list.iter().position(|v| v.id == e.id))
-                    .unwrap_or(0);
-                let j = if k == K::Down && i + 1 == self.list.len() && self.raw_count == 256 {
-                    self.pos.offset += 255;
-                    self.reload(false)?;
-                    usize::from(self.list.len() > 1)
-                } else if k == K::Up && i == 0 && self.pos.offset > 0 {
-                    self.pos.offset = self.pos.offset.saturating_sub(255);
-                    self.reload(false)?;
-                    self.list.len().saturating_sub(2)
-                } else if k == K::Down {
-                    (i + 1).min(self.list.len().saturating_sub(1))
-                } else {
-                    i.saturating_sub(1)
-                };
-                self.pos.entry = self.list.get(j).cloned();
-                self.load(true)?
+                self.move_entry(k == K::Down)?;
             }
             _ => {}
         }
         Ok(false)
     }
+    fn path_lines(&self, area: Rect) -> Vec<String> {
+        if !matches!(self.panel, Panel::Main | Panel::Search | Panel::Links) {
+            return Vec::new();
+        }
+        self.pos.entry.as_ref().map_or_else(Vec::new, |entry| {
+            wrap_path(
+                &terminal_text(&entry.path),
+                area.width.saturating_sub(2) as usize,
+                area.height.saturating_sub(6).max(1) as usize,
+            )
+        })
+    }
+
     fn draw(&self, f: &mut Frame) {
-        let area = f.area().inner(Margin {
-            horizontal: 1,
-            vertical: 0,
-        });
-        let bands = Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(area);
+        let path = self.path_lines(f.area());
+        let bands = screen_bands(f.area(), path.len());
         let name = std::path::Path::new(&self.root)
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("TraceTracking  ", Style::new().fg(ACC).bold()),
-                Span::raw(name),
-                Span::styled(
-                    format!(
-                        "   ·   {}{}",
-                        self.status,
-                        if self.pending {
-                            "   ↑ 有新记录  g"
-                        } else {
-                            ""
-                        }
-                    ),
-                    Style::new().fg(DIM),
+        let mut heading = vec![Line::from(vec![
+            Span::styled("TraceTracking  ", Style::new().fg(ACC).bold()),
+            Span::raw(name),
+            Span::styled(
+                format!(
+                    "   ·   {}{}",
+                    self.status,
+                    if self.pending {
+                        "   ↑ 有新记录  g"
+                    } else {
+                        ""
+                    }
                 ),
-            ])),
-            bands[0],
-        );
+                Style::new().fg(DIM),
+            ),
+        ])];
+        heading.extend(path.into_iter().map(Line::raw));
+        f.render_widget(Paragraph::new(heading), bands[0]);
         let main = matches!(self.panel, Panel::Main | Panel::Search);
         if main {
-            let wide = area.width >= 78;
-            let cols = Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)])
-                .split(bands[1]);
-            if wide || !self.pos.body {
-                let a = if wide { cols[0] } else { bands[1] };
+            let [events, body] = reader_panes(bands[1], self.pos.body);
+            if !events.is_empty() {
+                let a = events;
                 let h = a.height.saturating_sub(1) as usize;
                 let index = self
                     .pos
@@ -708,6 +847,7 @@ impl App {
                 let start = index
                     .saturating_sub(h / 2)
                     .min(self.list.len().saturating_sub(h));
+                let today = chrono::Local::now().date_naive();
                 let lines = self
                     .list
                     .iter()
@@ -715,11 +855,16 @@ impl App {
                     .skip(start)
                     .take(h)
                     .map(|(i, e)| {
-                        let time = chrono::DateTime::from_timestamp(e.stamp, 0)
+                        let local = chrono::DateTime::from_timestamp(e.stamp, 0)
+                            .map(|t| t.with_timezone(&chrono::Local));
+                        let time = local
                             .map(|t| {
-                                t.with_timezone(&chrono::Local)
-                                    .format("%m-%d %H:%M")
-                                    .to_string()
+                                t.format(if t.date_naive() == today {
+                                    "%H:%M"
+                                } else {
+                                    "%m-%d"
+                                })
+                                .to_string()
                             })
                             .unwrap_or_default();
                         let count = self
@@ -728,20 +873,15 @@ impl App {
                             .map(|(_, n)| format!(" ×{n}"))
                             .unwrap_or_default();
                         let mark = if i == index { "▸" } else { "│" };
-                        let name = e.path.rsplit('/').next().unwrap_or(&e.path);
-                        let display =
-                            if e.path.chars().count() + 19 > a.width as usize && name != e.path {
-                                format!("…/{name}")
-                            } else {
-                                e.path.clone()
-                            };
-                        Line::from(format!("{mark} {time} {} {display}{count}", e.kind)).style(
-                            if i == index {
-                                Style::new().fg(ACC).bold()
-                            } else {
-                                Style::default()
-                            },
-                        )
+                        let prefix = format!("{mark} {time} {} ", e.kind);
+                        let width =
+                            (a.width as usize).saturating_sub(prefix.width() + count.width());
+                        let display = compact_path(&terminal_text(&e.path), width);
+                        Line::from(format!("{prefix}{display}{count}")).style(if i == index {
+                            Style::new().fg(ACC).bold()
+                        } else {
+                            Style::default()
+                        })
                     })
                     .collect::<Vec<_>>();
                 let title = if !self.pos.query.is_empty() {
@@ -763,8 +903,8 @@ impl App {
                     a,
                 );
             }
-            if wide || self.pos.body {
-                let a = if wide { cols[1] } else { bands[1] };
+            if !body.is_empty() {
+                let a = body;
                 let h = a.height.saturating_sub(2) as usize;
                 let start = visible_top(self.pos.top, self.pos.line, self.rows.len(), h);
                 let previous = self.changes.partition_point(|&row| row <= self.pos.line);
@@ -785,6 +925,17 @@ impl App {
                     summary.push_str(&format!("  [{} / {}] 变化", previous, self.changes.len()));
                 } else if let Some(note) = self.comparison_note {
                     summary.push_str(&format!("  ·  {note}"));
+                }
+                if let Some(local) = self
+                    .pos
+                    .entry
+                    .as_ref()
+                    .and_then(|e| chrono::DateTime::from_timestamp(e.stamp, 0))
+                {
+                    summary.push_str(&format!(
+                        "  ·  {}",
+                        local.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S")
+                    ));
                 }
                 if !self.source.is_empty() {
                     summary.push_str(&format!("  ·  {}", self.source));
@@ -826,7 +977,7 @@ impl App {
                 f.render_widget(
                     Paragraph::new(lines).block(
                         Block::default()
-                            .title(self.pos.entry.as_ref().map_or("正文", |e| e.path.as_str()))
+                            .title("文件")
                             .borders(Borders::TOP)
                             .border_style(Style::new().fg(DIM)),
                     ),
@@ -843,15 +994,45 @@ impl App {
                 Panel::Links => "引用与定义 · 当前索引",
                 _ => "",
             };
+            let target = if matches!(self.panel, Panel::Links) {
+                self.targets.get(self.choice)
+            } else {
+                None
+            };
+            let [list_area, preview_area] = if target.is_some() {
+                link_panes(bands[1])
+            } else {
+                [bands[1], Rect::default()]
+            };
             let mut lines = Vec::new();
             for (i, s) in self
                 .options
                 .iter()
                 .enumerate()
-                .skip(self.choice.saturating_sub(bands[1].height as usize / 2))
+                .skip(
+                    self.choice
+                        .saturating_sub(list_area.height.saturating_sub(1) as usize / 2),
+                )
+                .take(list_area.height.saturating_sub(1) as usize)
             {
+                let text = if matches!(self.panel, Panel::Links)
+                    && let Some(candidate) = self.targets.get(i)
+                {
+                    let path = terminal_text(&candidate.event.path);
+                    let suffix = format!(":{}", candidate.line + 1);
+                    let width =
+                        (list_area.width as usize).saturating_sub(s.width() + suffix.width() + 4);
+                    let display = if path.width() <= width {
+                        path
+                    } else {
+                        compact_path(&path, width)
+                    };
+                    format!("{s}  {display}{suffix}")
+                } else {
+                    s.clone()
+                };
                 lines.push(Line::styled(
-                    format!("{} {s}", if i == self.choice { "›" } else { " " }),
+                    format!("{} {text}", if i == self.choice { "›" } else { " " }),
                     if i == self.choice {
                         Style::new().fg(ACC)
                     } else {
@@ -863,43 +1044,54 @@ impl App {
                 lines = vec![Line::from(format!("{}▏", self.input))];
             }
             if lines.is_empty() {
-                lines.push(Line::styled("暂无匹配", Style::new().fg(DIM)));
+                let message = if matches!(self.panel, Panel::Links) {
+                    if self.references.is_some() {
+                        "正在查找引用…"
+                    } else {
+                        self.reference_error
+                            .as_deref()
+                            .unwrap_or("没有找到引用或定义候选")
+                    }
+                } else {
+                    "暂无匹配"
+                };
+                lines.push(Line::styled(message, Style::new().fg(DIM)));
             }
-            let mut list_area = bands[1];
-            if matches!(self.panel, Panel::Links)
-                && let Some(target) = self.targets.get(self.choice)
+            if let Some(target) = target
+                && let Ok((_, Some(body), _)) = store::bodies(&self.db, target.event.id)
             {
-                let areas =
-                    Layout::vertical([Constraint::Percentage(57), Constraint::Percentage(43)])
-                        .split(bands[1]);
-                list_area = areas[0];
-                if let Ok((_, Some(body), _)) = store::bodies(&self.db, target.event.id) {
-                    let start = target.line.saturating_sub(2);
-                    let lines = body
-                        .lines()
-                        .enumerate()
-                        .skip(start)
-                        .take(areas[1].height as usize)
-                        .map(|(i, s)| {
-                            Line::styled(
-                                format!("{:>4}  {}", i + 1, s),
-                                if i == target.line {
-                                    Style::new().fg(ACC)
-                                } else {
-                                    Style::default()
-                                },
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    f.render_widget(
-                        Paragraph::new(lines).block(
-                            Block::default()
-                                .title(format!("当前版本 · {}", target.event.path))
-                                .borders(Borders::TOP),
-                        ),
-                        areas[1],
-                    );
-                }
+                let start = target.line.saturating_sub(2);
+                let lines = body
+                    .lines()
+                    .enumerate()
+                    .skip(start)
+                    .take(preview_area.height.saturating_sub(1) as usize)
+                    .map(|(i, s)| {
+                        Line::styled(
+                            format!("{:>4}  {}", i + 1, s),
+                            if i == target.line {
+                                Style::new().fg(ACC)
+                            } else {
+                                Style::default()
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let path = terminal_text(&target.event.path);
+                let width = (preview_area.width as usize).saturating_sub("当前版本 · ".width());
+                let caption = if path.width() <= width {
+                    path
+                } else {
+                    compact_path(&path, width)
+                };
+                f.render_widget(
+                    Paragraph::new(lines).block(
+                        Block::default()
+                            .title(format!("当前版本 · {caption}"))
+                            .borders(Borders::TOP),
+                    ),
+                    preview_area,
+                );
             }
             f.render_widget(
                 Paragraph::new(lines).block(Block::default().title(title).borders(Borders::TOP)),
@@ -912,6 +1104,12 @@ impl App {
                 ["路径", "正文", "变更"][self.pos.mode],
                 self.pos.query
             )
+        } else if matches!(self.panel, Panel::Links) {
+            if self.references.is_some() {
+                "Esc 取消查找".into()
+            } else {
+                "↑↓ 预览   Enter 跳转   Esc 返回".into()
+            }
         } else if !main {
             "↑↓ 选择   Enter 确定   Esc 返回".into()
         } else if let Some(notice) = self.notice {
@@ -922,11 +1120,114 @@ impl App {
                 if self.pos.diff { "正文" } else { "对比" }
             )
         } else {
-            "↑↓ 事件  Enter 阅读  [ / ] 变化  d 对比  / 搜索  ? 帮助".into()
+            "↑↓ 事件  Enter 阅读  r 引用  [ / ] 变化  d 对比  / 搜索".into()
         };
         f.render_widget(Paragraph::new(hint).style(Style::new().fg(ACC)), bands[2]);
     }
 }
+fn screen_bands(area: Rect, path_rows: usize) -> [Rect; 3] {
+    Layout::vertical([
+        Constraint::Length(1 + path_rows.max(1) as u16),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(area.inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    }))
+}
+
+fn reader_panes(content: Rect, reading: bool) -> [Rect; 2] {
+    if content.width >= 78 {
+        let sidebar = (content.width / 4).clamp(24, 34);
+        Layout::horizontal([Constraint::Length(sidebar), Constraint::Min(1)]).areas(content)
+    } else if reading {
+        [Rect::default(), content]
+    } else {
+        [content, Rect::default()]
+    }
+}
+
+fn compact_path(path: &str, width: usize) -> String {
+    let Some((first, rest)) = path.split_once('/') else {
+        return ellipsis_tail(path, width);
+    };
+    let name = rest.rsplit('/').next().unwrap_or(rest);
+    if !rest.contains('/') && path.width() <= width {
+        return path.into();
+    }
+    if width < 9 {
+        return ellipsis_tail(name, width);
+    }
+    let separator = "/…/";
+    let available = width - separator.width();
+    let head = first
+        .width()
+        .min(available / 2)
+        .min(available.saturating_sub(name.width()).max(available / 4));
+    let first = take_prefix(first, head);
+    format!(
+        "{first}{separator}{}",
+        ellipsis_tail(name, available - first.width())
+    )
+}
+
+fn take_prefix(text: &str, width: usize) -> &str {
+    let mut used = 0;
+    for (i, ch) in text.char_indices() {
+        used += ch.width().unwrap_or(0);
+        if used > width {
+            return &text[..i];
+        }
+    }
+    text
+}
+
+fn ellipsis_tail(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if text.width() <= width {
+        return text.into();
+    }
+    let mut used = 1;
+    for (i, ch) in text.char_indices().rev() {
+        used += ch.width().unwrap_or(0);
+        if used > width {
+            return format!("…{}", &text[i + ch.len_utf8()..]);
+        }
+    }
+    text.into()
+}
+
+fn wrap_path(mut path: &str, width: usize, max_lines: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    while !path.is_empty() && lines.len() < max_lines {
+        let head = take_prefix(path, width);
+        if head.is_empty() {
+            break;
+        }
+        if lines.len() + 1 == max_lines {
+            lines.push(ellipsis_tail(path, width));
+            break;
+        }
+        let head = if head.len() < path.len()
+            && let Some(end) = head.rfind('/')
+        {
+            &head[..=end]
+        } else {
+            head
+        };
+        lines.push(head.to_string());
+        path = &path[head.len()..];
+    }
+    lines
+}
+
+fn link_panes(content: Rect) -> [Rect; 2] {
+    Layout::vertical([Constraint::Percentage(57), Constraint::Percentage(43)]).areas(content)
+}
+
 fn visible_top(top: usize, line: usize, rows: usize, height: usize) -> usize {
     let height = height.max(1);
     top.clamp(line.saturating_add(1).saturating_sub(height), line)
@@ -960,6 +1261,7 @@ fn ignore_options(path: &str) -> Vec<String> {
 struct Restore;
 impl Drop for Restore {
     fn drop(&mut self) {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
     }
@@ -968,6 +1270,14 @@ pub fn run(db: Connection, root: String) -> Result<()> {
     enable_raw_mode()?;
     let _restore = Restore;
     execute!(io::stdout(), EnterAlternateScreen)?;
+    #[cfg(windows)]
+    execute!(io::stdout(), crossterm::event::EnableMouseCapture)?;
+    // Track buttons and wheel coordinates on ANSI terminals without requesting pointer motion.
+    #[cfg(not(windows))]
+    execute!(
+        io::stdout(),
+        crossterm::style::Print("\x1b[?1000h\x1b[?1006h")
+    )?;
     let mut term: Terminal<CrosstermBackend<Stdout>> =
         Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let worker = watch::start(root.clone());
@@ -994,6 +1304,8 @@ pub fn run(db: Connection, root: String) -> Result<()> {
         raw_count: 0,
         positions: Default::default(),
         search: None,
+        references: None,
+        reference_error: None,
         search_after: None,
         input: String::new(),
         follow: true,
@@ -1003,6 +1315,7 @@ pub fn run(db: Connection, root: String) -> Result<()> {
     a.reload(false)?;
     loop {
         a.search_tick()?;
+        a.references_tick();
         while let Ok(s) = a.worker.updates.try_recv() {
             a.status = s;
             if a.follow || a.pos.entry.is_none() {
@@ -1016,7 +1329,8 @@ pub fn run(db: Connection, root: String) -> Result<()> {
             term.draw(|f| a.draw(f))?;
             a.dirty = false;
         }
-        if event::poll(Duration::from_millis(250))? {
+        let poll_ms = if a.references.is_some() { 35 } else { 250 };
+        if event::poll(Duration::from_millis(poll_ms))? {
             match event::read()? {
                 Event::Key(k) if k.kind != KeyEventKind::Release => {
                     if (k.code == K::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL))
@@ -1025,6 +1339,15 @@ pub fn run(db: Connection, root: String) -> Result<()> {
                         break;
                     }
                     a.dirty = true
+                }
+                Event::Mouse(event)
+                    if matches!(
+                        event.kind,
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                    ) =>
+                {
+                    let size = term.size()?;
+                    a.dirty |= a.mouse(event, Rect::new(0, 0, size.width, size.height))?;
                 }
                 Event::Resize(..) => a.dirty = true,
                 _ => {}
@@ -1066,6 +1389,20 @@ mod tests {
                 .is_ignore()
         );
         Ok(())
+    }
+
+    #[test]
+    fn path_labels_preserve_the_filename_and_wrap_at_slashes() {
+        assert_eq!(
+            compact_path("服务/config/production/app.yml", 20),
+            "服务/…/app.yml"
+        );
+        assert_eq!(compact_path("config/app.yml", 20), "config/app.yml");
+        let path = "服务/config/production/app.yml";
+        let heading = wrap_path(path, 12, 4);
+        assert_eq!(heading.concat(), path);
+        assert_eq!(heading.last().map(String::as_str), Some("app.yml"));
+        assert!(heading.iter().all(|line| line.width() <= 12));
     }
 
     #[test]

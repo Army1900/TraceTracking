@@ -29,6 +29,10 @@ Windows、macOS 和 Linux 使用相同命令。也可以直接执行 `cargo run 
 | G | 查看所选路径的最近 100 条 Git 提交，进入版本后用 d 与事件快照对比 |
 | ? / q | 帮助、退出 |
 
+鼠标滚轮在时间轴上切换记录，在正文上滚动当前文件，在项目、引用和忽略等列表中移动选中项。长路径在左栏显示为「首级目录/…/文件名」，选中项的完整相对路径显示在页首。
+
+查看某行的引用时，先按 Enter 进入正文，用 ↑↓ 移到目标行，再按 `r`。查询在后台执行。结果出来后用 ↑↓ 预览，按 Enter 跳转，按 Esc 取消查询或逐层返回。
+
 时间轴中的 B 是首次观察到的基线，时间取自文件修改时间。A、M、D 表示新增、修改和删除，O 表示再次打开时观察到的内容差异。系统提供成对移动事件时记录 R，其余情况保留观察到的新增和删除。浏览历史期间按 g 可以查看新记录。
 
 ## 追踪与存储
@@ -37,7 +41,7 @@ Windows、macOS 和 Linux 使用相同命令。也可以直接执行 `cargo run 
 
 版本和索引存入系统本地应用数据目录中的 `TraceTracking/history.sqlite3`。可用环境变量 `TT_DATA_DIR` 指定数据目录。相同内容复用一份快照。UTF-8 文本的正文上限为 1 MiB，更大文件或二进制文件只记录事件。历史数据库随项目变化增长，当前版本保留全部记录。
 
-正文和 diff 支持 Java、Python、TypeScript、JavaScript、Rust、Markdown 和 XML 的语法高亮。支持 Java、Rust、TypeScript、JavaScript、Python 声明的 Tree-sitter 索引，以及本地路径、Markdown 链接、XML 的 href/src/resource 等属性和配置路径引用。定义候选依据名称匹配；引用面板使用当前项目索引，预览会显示目标路径和行号。
+正文和 diff 支持 Java、Python、TypeScript、JavaScript、Rust、Markdown、YAML 和 XML 的语法高亮。支持 Java、Rust、TypeScript、JavaScript、Python 声明的 Tree-sitter 索引，以及本地路径、Markdown 链接、XML 的 href/src/resource 等属性和配置路径引用。定义候选依据名称匹配；引用面板使用当前项目索引，预览会显示目标路径和行号。
 
 ## 忽略与来源
 

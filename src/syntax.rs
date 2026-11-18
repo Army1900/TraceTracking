@@ -107,6 +107,13 @@ fn grammar(extension: &str) -> Option<&'static HighlightConfiguration> {
             tree_sitter_rust::HIGHLIGHTS_QUERY,
         )
     });
+    static YAML: LazyLock<Option<HighlightConfiguration>> = LazyLock::new(|| {
+        config(
+            tree_sitter_yaml::LANGUAGE.into(),
+            "YAML",
+            tree_sitter_yaml::HIGHLIGHTS_QUERY,
+        )
+    });
     match extension {
         "java" => JAVA.as_ref(),
         "py" | "pyi" => PY.as_ref(),
@@ -114,6 +121,7 @@ fn grammar(extension: &str) -> Option<&'static HighlightConfiguration> {
         "ts" | "mts" | "cts" => TS.as_ref(),
         "tsx" => TSX.as_ref(),
         "rs" => RS.as_ref(),
+        "yaml" | "yml" => YAML.as_ref(),
         _ => None,
     }
 }
@@ -244,7 +252,7 @@ impl Syntax {
     }
 }
 
-fn terminal_text(line: &str) -> String {
+pub fn terminal_text(line: &str) -> String {
     line.replace('\t', "    ")
         .replace(|c: char| c.is_control(), "�")
 }
@@ -260,6 +268,9 @@ mod tests {
             ("a.ts", "const value: number = 4;", "const", "keyword"),
             ("a.tsx", "const view = <div/>;", "const", "keyword"),
             ("a.js", "const label = 'text';", "const", "keyword"),
+            ("a.yaml", "port: 8080", "port", "property"),
+            ("a.yml", "enabled: false", "false", "boolean"),
+            ("a.yaml", "port: 8080 # default", "# default", "comment"),
             ("a.md", "# 中文标题", "# 中文标题", "keyword"),
             ("a.xml", "<item name=\"中文\"/>", "name", "attribute"),
         ] {

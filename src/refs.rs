@@ -8,7 +8,7 @@ use std::{
 };
 #[derive(Clone)]
 pub struct Target {
-    pub label: String,
+    pub label: &'static str,
     pub event: Entry,
     pub line: usize,
 }
@@ -284,22 +284,25 @@ pub fn links(
     path: &str,
     body: &str,
     line: usize,
+    cancelled: impl Fn() -> bool,
 ) -> Result<Vec<Target>> {
     let filter = crate::store::rules(db, root)?;
     let mut out = vec![];
     let mut seen = std::collections::HashSet::new();
-    let mut add = |p: &str, n: usize, label: &str| -> Result<()> {
-        if out.len() >= 200
-            || filter
-                .matched_path_or_any_parents(Path::new(root).join(p), false)
-                .is_ignore()
+    let mut add = |p: &str, n: usize, label: &'static str| -> Result<bool> {
+        if cancelled() {
+            return Ok(true);
+        }
+        if filter
+            .matched_path_or_any_parents(Path::new(root).join(p), false)
+            .is_ignore()
         {
-            return Ok(());
+            return Ok(false);
         }
         let mut st=db.prepare_cached("SELECT e.id,e.kind,e.stamp FROM files f JOIN events e ON e.id=f.id WHERE f.root=? AND f.path=?")?;
         let mut rows = st.query(params![root, p])?;
         if let Some(r) = rows.next()?
-            && seen.insert((p.to_string(), n, label.to_string()))
+            && seen.insert((p.to_string(), n, label))
         {
             out.push(Target {
                 event: Entry {
@@ -309,46 +312,57 @@ pub fn links(
                     stamp: r.get(2)?,
                 },
                 line: n,
-                label: format!("{label}  {p}:{}", n + 1),
+                label,
             });
         }
-        Ok(())
+        Ok(out.len() >= 200)
     };
     let ext = Path::new(path)
         .extension()
         .and_then(|s| s.to_str())
         .unwrap_or("");
-    let mut st = db.prepare(
-        "SELECT name FROM symbols WHERE hash=? AND ext=? AND kind='link' ORDER BY abs(line-?)",
+    // Start from matching symbols, then check that the event is still the current file version.
+    let mut named = db.prepare(
+        "SELECT f.path,s.line FROM symbols s
+         CROSS JOIN events e ON e.new=s.hash AND e.root=?1
+         CROSS JOIN files f ON f.root=e.root AND f.path=e.path AND f.id=e.id
+         WHERE s.kind=?2 AND s.name=?3 LIMIT 200",
     )?;
-    for raw in st.query_map(
-        params![crate::store::digest(body.as_bytes()), ext, line],
-        |r| r.get::<_, String>(0),
-    )? {
+    let read_match =
+        |row: &rusqlite::Row<'_>| Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?));
+    let hash = crate::store::digest(body.as_bytes());
+    let mut st = db.prepare(
+        "SELECT name FROM symbols WHERE hash=? AND ext=? AND kind='link' GROUP BY name ORDER BY min(abs(line-?))",
+    )?;
+    for raw in st.query_map(params![hash, ext, line], |r| r.get::<_, String>(0))? {
+        if cancelled() {
+            return Ok(out);
+        }
         for target in candidates(path, &raw?) {
             if target.starts_with("java:") {
-                let mut q=db.prepare_cached("SELECT f.path,s.line FROM symbols s JOIN events e ON s.hash=e.new JOIN files f ON f.id=e.id WHERE f.root=? AND s.kind='qualified' AND s.name=?")?;
-                for row in q.query_map(params![root, target], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, usize>(1)?))
-                })? {
+                for row in named.query_map(params![root, "qualified", target], read_match)? {
                     let (p, n) = row?;
-                    add(&p, n, "引用")?;
+                    if add(&p, n, "引用")? {
+                        return Ok(out);
+                    }
                 }
-            } else {
-                add(&target, 0, "引用")?;
+            } else if add(&target, 0, "引用")? {
+                return Ok(out);
             }
         }
     }
-    let mut defs=db.prepare("SELECT f.path,s.line FROM symbols s JOIN events e ON e.new=s.hash JOIN files f ON f.id=e.id WHERE f.root=? AND s.kind='def' AND s.name=? LIMIT 200")?;
+    let mut words = std::collections::HashSet::new();
     for name in NAME
         .find_iter(body.lines().nth(line).unwrap_or(""))
+        .map(|m| m.as_str())
+        .filter(|name| words.insert(*name))
         .take(32)
     {
-        for row in defs.query_map(params![root, name.as_str()], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, usize>(1)?))
-        })? {
+        for row in named.query_map(params![root, "def", name], read_match)? {
             let (p, n) = row?;
-            add(&p, n, "定义候选")?;
+            if add(&p, n, "定义候选")? {
+                return Ok(out);
+            }
         }
     }
     let mut rev = db.prepare("SELECT path,line FROM edges WHERE root=? AND target=? LIMIT 200")?;
@@ -357,7 +371,7 @@ pub fn links(
         reverse_keys.extend(crate::store::strings(
             db,
             "SELECT name FROM symbols WHERE hash=? AND kind='qualified'",
-            [crate::store::digest(body.as_bytes())],
+            [hash],
         )?);
     }
     for key in reverse_keys {
@@ -365,7 +379,9 @@ pub fn links(
             Ok((r.get::<_, String>(0)?, r.get::<_, usize>(1)?))
         })? {
             let (p, n) = row?;
-            add(&p, n, "被引用")?;
+            if add(&p, n, "被引用")? {
+                return Ok(out);
+            }
         }
     }
     Ok(out)

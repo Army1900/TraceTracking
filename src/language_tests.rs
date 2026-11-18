@@ -26,7 +26,14 @@ fn check(case: Case) -> Result<()> {
     let mut db = store::test_database()?;
     let filter = store::rules(&db, root)?;
     store::scan(&mut db, root, &dir, &filter, true)?;
-    let forward = refs::links(&db, root, case.source, case.body, case.reference_line)?;
+    let forward = refs::links(
+        &db,
+        root,
+        case.source,
+        case.body,
+        case.reference_line,
+        || false,
+    )?;
     assert!(
         forward
             .iter()
@@ -44,7 +51,7 @@ fn check(case: Case) -> Result<()> {
             case.target
         );
     }
-    let back = refs::links(&db, root, case.target, case.target_body, 0)?;
+    let back = refs::links(&db, root, case.target, case.target_body, 0, || false)?;
     assert!(
         back.iter().any(|t| t.event.path == case.source
             && t.line == case.reference_line
