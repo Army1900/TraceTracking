@@ -38,6 +38,7 @@ const DIM: Color = Color::DarkGray;
 struct Position {
     entry: Option<Entry>,
     recent: bool,
+    git_only: bool,
     folded: bool,
     only: String,
     query: String,
@@ -108,6 +109,7 @@ struct Preview {
 #[derive(PartialEq, Eq)]
 struct ViewKey {
     recent: bool,
+    git_only: bool,
     folded: bool,
     only: String,
     query: String,
@@ -120,6 +122,7 @@ impl ViewKey {
     fn of(pos: &Position, recent: bool) -> Self {
         Self {
             recent,
+            git_only: pos.git_only,
             folded: pos.folded,
             only: pos.only.clone(),
             query: pos.query.clone(),
@@ -157,6 +160,7 @@ struct ViewSwitch {
     cached: Option<CachedView>,
     wanted: bool,
     refresh_due: bool,
+    refilter: bool,
     epoch: u64,
     active_epoch: Option<u64>,
     transition: Option<Instant>,
@@ -167,6 +171,7 @@ const TRANSITION: Duration = Duration::from_millis(128);
 
 struct Bookmark {
     epoch: Option<u64>,
+    refilter: bool,
     position: Position,
     panel: Panel,
     choice: usize,
@@ -267,7 +272,7 @@ struct App {
     root: String,
     worker: watch::Worker,
     git_monitor: StatusMonitor,
-    git_status: Option<Statuses>,
+    git_status: Option<Arc<Statuses>>,
     activity: Activity,
     status: String,
     pos: Position,
@@ -293,20 +298,37 @@ struct App {
     dirty: bool,
 }
 impl ViewQuery {
-    fn start(root: String, mut pos: Position, recent: bool, epoch: u64, size: Size) -> Self {
+    fn start(
+        root: String,
+        mut pos: Position,
+        recent: bool,
+        epoch: u64,
+        size: Size,
+        git_status: Option<Arc<Statuses>>,
+        keep_selection: bool,
+    ) -> Self {
         let key = ViewKey::of(&pos, recent);
         pos.recent = recent;
         pos.offset = 0;
+        let keep_selection = keep_selection && pos.revision.is_none();
         pos.revision = None;
         let area = Rect::new(0, 0, size.width, size.height);
         let width = reader_panes(screen_bands(area, 0)[1], true)[1].width;
         let task = QueryTask::start(move |db, cancelled| {
-            let mut list = store::entries(db, pos.entry_query(&root))?;
+            let mut list = store::entries(db, pos.entry_query(&root, &git_status))?;
             let raw_count = list.len();
             let groups = fold_page(&mut list, &pos);
-            pos.entry = list.first().cloned();
+            let selected = if keep_selection {
+                pos.entry
+                    .as_ref()
+                    .and_then(|entry| list.iter().find(|e| e.id == entry.id))
+            } else {
+                None
+            };
+            let locate = selected.is_none();
+            pos.entry = selected.or_else(|| list.first()).cloned();
             anyhow::ensure!(!cancelled.load(Ordering::Relaxed), "查询已取消");
-            let mut preview = Preview::prepare(db, &root, &mut pos, &groups, true)?;
+            let mut preview = Preview::prepare(db, &root, &mut pos, &groups, locate)?;
             anyhow::ensure!(!cancelled.load(Ordering::Relaxed), "查询已取消");
             preview.prepare_wrap(width);
             Ok(ViewPage {
@@ -361,7 +383,11 @@ fn fold_page(list: &mut Vec<Entry>, pos: &Position) -> Groups {
 }
 
 impl Position {
-    fn entry_query<'a>(&'a self, root: &'a str) -> store::EntryQuery<'a> {
+    fn entry_query<'a>(
+        &'a self,
+        root: &'a str,
+        git_status: &Option<Arc<Statuses>>,
+    ) -> store::EntryQuery<'a> {
         store::EntryQuery {
             root,
             recent: self.recent,
@@ -370,6 +396,11 @@ impl Position {
             mode: self.mode,
             offset: self.offset,
             session: self.session,
+            git_status: if self.git_only {
+                git_status.clone()
+            } else {
+                None
+            },
         }
     }
     fn anchor_row(&mut self, row: usize) {
@@ -585,28 +616,31 @@ impl App {
     }
 
     fn show_alternate(&mut self, target: CachedView) {
-        let previous =
-            if self.views.active_epoch == Some(self.views.epoch) && self.pos.revision.is_none() {
-                Some(CachedView {
-                    key: ViewKey::of(&self.pos, self.pos.recent),
-                    epoch: self.views.epoch,
-                    page: ViewPage {
-                        pos: self.pos.clone(),
-                        list: std::mem::take(&mut self.list),
-                        groups: std::mem::take(&mut self.groups),
-                        raw_count: self.raw_count,
-                        preview: std::mem::take(&mut self.preview),
-                    },
-                })
-            } else {
-                None
-            };
+        let previous = if !self.views.refilter
+            && self.views.active_epoch == Some(self.views.epoch)
+            && self.pos.revision.is_none()
+        {
+            Some(CachedView {
+                key: ViewKey::of(&self.pos, self.pos.recent),
+                epoch: self.views.epoch,
+                page: ViewPage {
+                    pos: self.pos.clone(),
+                    list: std::mem::take(&mut self.list),
+                    groups: std::mem::take(&mut self.groups),
+                    raw_count: self.raw_count,
+                    preview: std::mem::take(&mut self.preview),
+                },
+            })
+        } else {
+            None
+        };
         self.pending = target.epoch != self.views.epoch;
         self.apply_page(target.page, target.epoch);
         self.views.cached = previous;
         self.views.wanted = false;
         self.views.refresh = None;
         self.views.refresh_due = false;
+        self.views.refilter = false;
         self.views.transition = Some(Instant::now());
     }
 
@@ -631,6 +665,42 @@ impl App {
         }
     }
 
+    fn queue_git_filter(&mut self) {
+        self.views.refresh = None;
+        self.views.refresh_due = true;
+        self.views.refilter = true;
+    }
+
+    fn toggle_git_filter(&mut self) {
+        if self.git_status.is_none() {
+            self.notice = Some("当前目录暂无 Git 状态");
+            self.git_monitor.refresh();
+            return;
+        }
+        self.search = None;
+        self.search_after = None;
+        self.pos.git_only = !self.pos.git_only;
+        self.queue_git_filter();
+    }
+
+    fn update_git_status(&mut self, statuses: Statuses) {
+        if self.git_status.as_deref() == Some(&statuses) {
+            return;
+        }
+        let changed_paths = self.git_status.as_ref().is_none_or(|previous| {
+            previous.len() != statuses.len()
+                || previous.keys().any(|path| !statuses.contains_key(path))
+        });
+        self.git_status = Some(Arc::new(statuses));
+        if changed_paths {
+            self.views.epoch = self.views.epoch.wrapping_add(1);
+            if self.pos.git_only {
+                self.queue_git_filter();
+            }
+        }
+        self.dirty = true;
+    }
+
     fn view_tick(&mut self, size: Size) {
         if let Some(start) = self.views.transition {
             if start.elapsed() >= TRANSITION {
@@ -649,11 +719,15 @@ impl App {
         if let Some((job, result)) = ViewQuery::take_result(&mut self.views.refresh)
             && job.key == key
             && !self.views.wanted
-            && (self.follow || self.pos.entry.is_none())
+            && (self.follow || self.pos.entry.is_none() || self.views.refilter || self.pos.git_only)
         {
             match result {
-                Ok(page) => self.apply_page(page, job.epoch),
+                Ok(page) => {
+                    self.views.refilter = false;
+                    self.apply_page(page, job.epoch);
+                }
                 Err(_) => {
+                    self.views.refilter = false;
                     self.notice = Some("列表加载失败，按 g 重试");
                     self.dirty = true;
                 }
@@ -662,7 +736,7 @@ impl App {
         let alternate = ViewKey::of(&self.pos, !self.pos.recent);
         if let Some((job, result)) = ViewQuery::take_result(&mut self.views.preload)
             && job.key == alternate
-            && (job.epoch == self.views.epoch || self.views.wanted)
+            && (job.epoch == self.views.epoch || (self.views.wanted && !self.pos.git_only))
         {
             match result {
                 Ok(page) => {
@@ -690,7 +764,7 @@ impl App {
 
         if !self.views.wanted
             && self.views.refresh_due
-            && (self.follow || self.pos.entry.is_none())
+            && (self.follow || self.pos.entry.is_none() || self.views.refilter || self.pos.git_only)
             && self.views.refresh.is_none()
         {
             self.views.refresh_due = false;
@@ -700,6 +774,8 @@ impl App {
                 self.pos.recent,
                 self.views.epoch,
                 size,
+                self.git_status.clone(),
+                self.views.refilter || (self.pos.git_only && !self.follow),
             ));
         }
         if self
@@ -733,6 +809,8 @@ impl App {
                 !self.pos.recent,
                 self.views.epoch,
                 size,
+                self.git_status.clone(),
+                false,
             ));
         }
     }
@@ -740,8 +818,9 @@ impl App {
     fn reload(&mut self, keep: bool) -> Result<()> {
         self.views.refresh = None;
         self.views.refresh_due = false;
+        self.views.refilter = false;
         self.views.active_epoch = Some(self.views.epoch);
-        self.list = store::entries(&self.db, self.pos.entry_query(&self.root))?;
+        self.list = store::entries(&self.db, self.pos.entry_query(&self.root, &self.git_status))?;
         self.group_page();
         self.activity.refresh = true;
         if !keep || self.pos.entry.is_none() {
@@ -859,6 +938,7 @@ impl App {
     fn push(&mut self) {
         self.stack.push(Bookmark {
             epoch: self.views.active_epoch,
+            refilter: self.views.refilter,
             position: self.pos.clone(),
             panel: std::mem::replace(&mut self.panel, Panel::Main),
             choice: self.choice,
@@ -875,6 +955,7 @@ impl App {
         self.search = None;
         self.search_after = None;
         if let Some(bookmark) = self.stack.pop() {
+            let scope_changed = self.pos.git_only != bookmark.position.git_only;
             self.views.active_epoch = bookmark.epoch;
             self.pos = bookmark.position;
             self.panel = bookmark.panel;
@@ -885,6 +966,16 @@ impl App {
             self.raw_count = bookmark.count;
             self.options = bookmark.options;
             self.targets = bookmark.targets;
+            if scope_changed {
+                self.views.refresh = None;
+                self.views.refresh_due = false;
+                self.views.refilter = false;
+            }
+            if bookmark.refilter
+                || (self.pos.git_only && self.views.active_epoch != Some(self.views.epoch))
+            {
+                self.queue_git_filter();
+            }
             if let Some(id) = self.pos.session
                 && let Some(tool) = agent::session_tool(&self.db, id)?
                 && !self.activity.follows(&tool)
@@ -994,6 +1085,7 @@ impl App {
         self.git_status = None;
         self.status = "建立基线".into();
         self.pos = self.positions.get(&self.root).cloned().unwrap_or_default();
+        self.pos.git_only = false;
         self.panel = Panel::Main;
         self.stack.clear();
         self.follow = self.pos.entry.is_none();
@@ -1014,8 +1106,9 @@ impl App {
             self.search_after = None;
             let root = self.root.clone();
             let pos = self.pos.clone();
+            let git_status = self.git_status.clone();
             self.search = Some(QueryTask::start(move |db, _| {
-                store::entries(db, pos.entry_query(&root))
+                store::entries(db, pos.entry_query(&root, &git_status))
             }));
         }
         if let Some(result) = self.search.as_ref().and_then(|s| s.results.try_recv().ok()) {
@@ -1031,7 +1124,7 @@ impl App {
         Ok(())
     }
     fn move_entry(&mut self, forward: bool) -> Result<bool> {
-        if self.list.is_empty() {
+        if self.views.refilter || self.list.is_empty() {
             return Ok(false);
         }
         let current = self.pos.entry.as_ref().map(|e| e.id);
@@ -1281,7 +1374,7 @@ impl App {
                     "d  切换对比     h  文件历史".into(),
                     "r  查引用与定义 · 正文里先用 ↑↓ 选一行".into(),
                     "a  AI 会话与变更筛选     i  忽略规则".into(),
-                    "t  时间轴 / 最近文件     g  最新".into(),
+                    "t  时间轴 / 最近文件     x  只看 Git 变更     g  最新".into(),
                     "G  Git 历史     /  搜索     p  项目     q  退出".into(),
                     "Git 两格状态  暂存区 / 工作区，?? 未跟踪".into(),
                 ];
@@ -1365,6 +1458,7 @@ impl App {
                 }
             }
             K::Char('t') => self.toggle_view(),
+            K::Char('x') => self.toggle_git_filter(),
             K::Char('g') => {
                 self.git_monitor.refresh();
                 self.views.epoch = self.views.epoch.wrapping_add(1);
@@ -1623,7 +1717,9 @@ impl App {
                         Line::from(spans).style(selected)
                     })
                     .collect::<Vec<_>>();
-                if lines.is_empty() && self.pos.session.is_some() {
+                if lines.is_empty() && self.pos.git_only && !self.views.refilter {
+                    lines.push(Line::styled("暂无 Git 变更", Style::new().fg(DIM)));
+                } else if lines.is_empty() && self.pos.session.is_some() {
                     lines.push(Line::styled("暂无已关联变更", Style::new().fg(DIM)));
                 }
                 let mut title = if !self.pos.query.is_empty() {
@@ -1642,7 +1738,11 @@ impl App {
                     let (icon, _) = self.activity.badge(&session.identity);
                     title.push_str(&format!(" · {icon} {}", session.identity.short()));
                 }
-                if self.git_status.is_some() {
+                if self.views.refilter {
+                    title.push_str(" · 筛选中");
+                } else if self.pos.git_only {
+                    title.push_str(" · Git 变更");
+                } else if self.git_status.is_some() {
                     title.push_str(" · Git");
                 }
                 let title_width = title.width() as u16;
@@ -1946,6 +2046,13 @@ impl App {
                 list_area,
             );
         }
+        let git = if self.pos.git_only {
+            "  x 全部"
+        } else if self.git_status.is_some() {
+            "  x Git 变更"
+        } else {
+            ""
+        };
         let hint = if matches!(self.panel, Panel::Search) {
             format!(
                 "/ {}  {}▏   Tab 范围 · Enter 确定",
@@ -1966,11 +2073,11 @@ impl App {
             notice.into()
         } else if self.pos.body {
             format!(
-                "↑↓  PgUp/PgDn 翻页  [ / ] 变化  d {}  r 引用  Esc 返回",
+                "↑↓  PgUp/PgDn 翻页  [ / ] 变化  d {}  r 引用{git}  Esc 返回",
                 if self.pos.diff { "正文" } else { "对比" }
             )
         } else {
-            "↑↓ 事件  Enter 阅读  a 会话  r 引用  [ / ] 变化  d 对比  / 搜索".into()
+            format!("↑↓ 事件  Enter 阅读{git}  a 会话  r 引用  [ / ] 变化  d 对比  / 搜索")
         };
         f.render_widget(Paragraph::new(hint).style(Style::new().fg(ACC)), bands[2]);
     }
@@ -2214,10 +2321,7 @@ pub fn run(db: Connection, root: String) -> Result<()> {
         a.search_tick()?;
         a.references_tick();
         while let Ok(statuses) = a.git_monitor.updates.try_recv() {
-            if a.git_status.as_ref() != Some(&statuses) {
-                a.git_status = Some(statuses);
-                a.dirty = true;
-            }
+            a.update_git_status(statuses);
         }
         while let Ok(s) = a.worker.updates.try_recv() {
             if s.starts_with("监听中") {
@@ -2227,7 +2331,7 @@ pub fn run(db: Connection, root: String) -> Result<()> {
             a.activity.refresh = true;
             a.views.epoch = a.views.epoch.wrapping_add(1);
             a.views.failed = None;
-            if a.follow || a.pos.entry.is_none() {
+            if a.follow || a.pos.entry.is_none() || a.pos.git_only {
                 a.views.refresh_due = true;
             } else {
                 a.pending = true;

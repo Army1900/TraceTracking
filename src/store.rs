@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -281,6 +282,7 @@ pub struct EntryQuery<'a> {
     pub mode: usize,
     pub offset: usize,
     pub session: Option<i64>,
+    pub git_status: Option<Arc<crate::git::Statuses>>,
 }
 
 pub fn entries(db: &Connection, query: EntryQuery<'_>) -> Result<Vec<Entry>> {
@@ -292,7 +294,18 @@ pub fn entries(db: &Connection, query: EntryQuery<'_>) -> Result<Vec<Entry>> {
         mode,
         offset,
         session,
+        git_status,
     } = query;
+    if git_status
+        .as_ref()
+        .is_some_and(|statuses| statuses.is_empty())
+    {
+        return Ok(Vec::new());
+    }
+    let git_paths = git_status
+        .as_ref()
+        .map(|statuses| serde_json::to_string(&statuses.keys().collect::<Vec<_>>()))
+        .transpose()?;
     let filter = rules(db, root)?;
     let base = PathBuf::from(root);
     db.create_scalar_function(
@@ -300,7 +313,7 @@ pub fn entries(db: &Connection, query: EntryQuery<'_>) -> Result<Vec<Entry>> {
         1,
         rusqlite::functions::FunctionFlags::SQLITE_UTF8,
         move |ctx| {
-            let p: String = ctx.get(0)?;
+            let p = ctx.get_raw(0).as_str()?;
             Ok(!filter
                 .matched_path_or_any_parents(base.join(p), false)
                 .is_ignore())
@@ -330,10 +343,24 @@ pub fn entries(db: &Connection, query: EntryQuery<'_>) -> Result<Vec<Entry>> {
             .any(|r| r.mark != ' ' && r.text.contains(&q)))
         },
     )?;
-    let table = if (recent || mode == 1) && session.is_none() {
+    let current_files = ((recent && git_paths.is_none()) || mode == 1) && session.is_none();
+    let table = if current_files {
         "files f JOIN events e ON f.id=e.id"
     } else {
         "events e"
+    };
+    // Start from Git's changed paths so clean-file history never has to be scanned.
+    let (git_table, git_filter) = match (git_paths.is_some(), current_files, recent, session) {
+        (false, ..) => ("", ""),
+        (true, true, ..) => (
+            "json_each(?6) git CROSS JOIN ",
+            "AND f.root=?1 AND f.path=git.value",
+        ),
+        (true, false, true, None) => (
+            "json_each(?6) git CROSS JOIN ",
+            "AND e.id=(SELECT max(id) FROM events WHERE root=?1 AND path=git.value)",
+        ),
+        (true, false, ..) => ("json_each(?6) git CROSS JOIN ", "AND e.path=git.value"),
     };
     let pred = match mode {
         1 => "instr((SELECT body FROM blobs WHERE hash=e.new),?3)>0",
@@ -353,14 +380,17 @@ pub fn entries(db: &Connection, query: EntryQuery<'_>) -> Result<Vec<Entry>> {
         String::new()
     };
     let sql = format!(
-        "SELECT e.id,e.path,e.kind,e.stamp FROM {table}
+        "SELECT e.id,e.path,e.kind,e.stamp FROM {git_table}{table}
          WHERE e.root=?1 AND (?2='' OR e.path=?2 OR (substr(?2,-1)='/' AND instr(e.path,?2)=1))
-           AND {pred} AND visible_path(e.path) AND (?5 IS NULL OR {session_filter}) {recent_filter}
+           AND {pred} AND visible_path(e.path) AND (?5 IS NULL OR {session_filter})
+           {git_filter} {recent_filter}
          ORDER BY e.stamp DESC,e.id DESC LIMIT 256 OFFSET ?4"
     );
+    let args: [&dyn rusqlite::ToSql; 6] = [&root, &only, &text, &offset, &session, &git_paths];
+    let param_count = if git_paths.is_some() { 6 } else { 5 };
     let mut entries = db
         .prepare(&sql)?
-        .query_map(params![root, only, text, offset, session], |r| {
+        .query_map(&args[..param_count], |r| {
             Ok(Entry {
                 id: r.get(0)?,
                 path: r.get(1)?,
@@ -476,6 +506,58 @@ pub fn test_database() -> Result<Connection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_filter_queries_changed_paths_before_paging() -> Result<()> {
+        use crate::git::{FileStatus, Statuses};
+
+        let db = test_database()?;
+        let root = "/project";
+        db.execute_batch(
+            "INSERT INTO events (root,path,stamp,kind) VALUES
+                ('/project','edit.txt',1,'B'),
+                ('/project','edit.txt',2,'M'),
+                ('/project','gone.txt',3,'D'),
+                ('/project','hidden.txt',4,'B');
+             INSERT INTO rules VALUES ('/project','hidden.txt');
+             WITH RECURSIVE clean(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM clean WHERE n<270)
+               INSERT INTO events (root,path,stamp,kind)
+               SELECT '/project','clean-'||n||'.txt',n+4,'B' FROM clean;
+             INSERT INTO files (root,path,id)
+               SELECT root,path,max(id) FROM events WHERE kind!='D' GROUP BY root,path;",
+        )?;
+        let statuses = Arc::new(Statuses::from([
+            ("edit.txt".into(), FileStatus(*b" M")),
+            ("gone.txt".into(), FileStatus(*b" D")),
+            ("hidden.txt".into(), FileStatus(*b"??")),
+        ]));
+        let query = |recent, offset| {
+            entries(
+                &db,
+                EntryQuery {
+                    root,
+                    recent,
+                    offset,
+                    git_status: Some(Arc::clone(&statuses)),
+                    ..Default::default()
+                },
+            )
+        };
+        let timeline = query(false, 0)?;
+        assert_eq!(
+            timeline.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
+            ["D", "M", "B"]
+        );
+        let recent = query(true, 0)?;
+        assert_eq!(
+            recent.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+            ["gone.txt", "edit.txt"]
+        );
+        assert_eq!(query(false, 2)?[0].kind, "B");
+        assert!(query(true, 2)?.is_empty());
+        Ok(())
+    }
+
     #[test]
     fn baseline_update_delete_and_references() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("tt-check-{}", std::process::id()));
