@@ -19,7 +19,9 @@ Windows、macOS 和 Linux 使用相同命令。也可以直接执行 `cargo run 
 | --- | --- |
 | ↑ ↓ / Enter / Esc | 预览、进入正文、沿原路返回 |
 | t / g | 时间轴与最近文件切换、回到最新记录 |
-| [ / ] / d | 上一处和下一处变化、切换行级对比 |
+| `[` / `]` | 跳到上一处或下一处变化，正文顶部显示当前位置和变化总数 |
+| `d` | 在正文和行级对比之间切换，保留当前变化位置 |
+| PgUp / PgDn | 按当前终端高度向前或向后翻一页 |
 | z / f / H | 折叠一分钟内相邻的同文件保存、按当前目录筛选、返回浏览起点 |
 | h / r | 查看文件历史、打开引用与定义候选 |
 | / | 搜索，Tab 选择路径、当前正文或历史变更，Enter 确定 |
@@ -35,11 +37,11 @@ Windows、macOS 和 Linux 使用相同命令。也可以直接执行 `cargo run 
 
 版本和索引存入系统本地应用数据目录中的 `TraceTracking/history.sqlite3`。可用环境变量 `TT_DATA_DIR` 指定数据目录。相同内容复用一份快照。UTF-8 文本的正文上限为 1 MiB，更大文件或二进制文件只记录事件。历史数据库随项目变化增长，当前版本保留全部记录。
 
-支持 Java、Rust、TypeScript、JavaScript、Python 声明的 Tree-sitter 索引，以及本地路径、Markdown 链接、XML 的 href/src/resource 等属性和配置路径引用。定义候选依据名称匹配；引用面板使用当前项目索引，预览会显示目标路径和行号。
+正文和 diff 支持 Java、Python、TypeScript、JavaScript、Rust、Markdown 和 XML 的语法高亮。支持 Java、Rust、TypeScript、JavaScript、Python 声明的 Tree-sitter 索引，以及本地路径、Markdown 链接、XML 的 href/src/resource 等属性和配置路径引用。定义候选依据名称匹配；引用面板使用当前项目索引，预览会显示目标路径和行号。
 
 ## 忽略与来源
 
-默认跳过 .git、node_modules、target、dist 和 __pycache__。规则按项目保存，支持 gitignore 风格的匹配。目录前的 / 表示从项目根匹配。
+默认跳过 .git、node_modules、target、dist 和 __pycache__。规则按项目保存，支持 gitignore 风格的匹配。目录前的 / 表示从项目根匹配。选中任意文件按 `i`，可以选择该文件、扩展名或从直接父目录到项目根下的任意一级父目录。
 
 ```sh
 tt ignore . "*.log"

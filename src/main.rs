@@ -1,6 +1,7 @@
 mod git;
 mod refs;
 mod store;
+mod syntax;
 mod ui;
 mod view;
 mod watch;

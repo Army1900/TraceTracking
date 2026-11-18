@@ -423,6 +423,10 @@ pub fn update_rule(db: &mut Connection, root: &str, rule: &str, add: bool) -> Re
     }
     Ok(())
 }
+#[cfg(test)]
+pub fn test_database() -> Result<Connection> {
+    schema(Connection::open_in_memory()?)
+}
 
 #[cfg(test)]
 mod tests {
@@ -454,8 +458,4 @@ mod tests {
         fs::remove_dir_all(dir)?;
         Ok(())
     }
-}
-#[cfg(test)]
-pub fn test_database() -> Result<Connection> {
-    schema(Connection::open_in_memory()?)
 }

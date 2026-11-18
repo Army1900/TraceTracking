@@ -66,18 +66,16 @@ pub fn index(db: &Connection, hash: &str, path: &str, body: &str) -> Result<()> 
                                 | b"resource"
                                 | b"schemaLocation"
                                 | b"noNamespaceSchemaLocation"
-                        ) {
-                            if let Ok(value) = attr.unescape_value() {
-                                for value in value.split_whitespace().filter(|v| !v.contains("://"))
-                                {
-                                    stmt.execute(params![
-                                        hash,
-                                        ext,
-                                        "link",
-                                        value.trim_start_matches("classpath:"),
-                                        line
-                                    ])?;
-                                }
+                        ) && let Ok(value) = attr.unescape_value()
+                        {
+                            for value in value.split_whitespace().filter(|v| !v.contains("://")) {
+                                stmt.execute(params![
+                                    hash,
+                                    ext,
+                                    "link",
+                                    value.trim_start_matches("classpath:"),
+                                    line
+                                ])?;
                             }
                         }
                     }

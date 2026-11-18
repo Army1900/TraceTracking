@@ -1,6 +1,7 @@
 use crate::{
     refs,
     store::{self, Entry},
+    syntax::Syntax,
     view::{self, Row},
     watch,
 };
@@ -31,6 +32,7 @@ struct Position {
     mode: usize,
     offset: usize,
     line: usize,
+    top: usize,
     body: bool,
     diff: bool,
     revision: Option<String>,
@@ -73,6 +75,11 @@ struct App {
     pos: Position,
     list: Vec<Entry>,
     rows: Vec<Row>,
+    syntax: Syntax,
+    old_syntax: Syntax,
+    changes: Vec<usize>,
+    comparison_note: Option<&'static str>,
+    notice: Option<&'static str>,
     source: String,
     stack: Vec<Bookmark>,
     panel: Panel,
@@ -134,27 +141,55 @@ impl App {
     }
     fn load(&mut self, locate: bool) -> Result<()> {
         self.rows.clear();
+        self.changes.clear();
         self.source.clear();
+        self.comparison_note = None;
+        self.syntax = Syntax::default();
+        self.old_syntax = Syntax::default();
+        if locate {
+            self.pos.line = 0;
+            self.pos.top = 0;
+        }
         if let Some(e) = &self.pos.entry {
-            let (mut a, b, s) = store::bodies(&self.db, e.id)?;
-            if let Some((oldest, _)) = self.groups.get(&e.id) {
+            let (mut a, b, source) = store::bodies(&self.db, e.id)?;
+            self.source = source;
+            if let Some((oldest, count)) = self.groups.get(&e.id) {
                 a = store::bodies(&self.db, *oldest)?.0;
-            }
-            self.source = s;
-            if let Some((_, count)) = self.groups.get(&e.id) {
                 self.source = format!("{count} 次保存 · 本组开始前至末次保存");
             }
-            self.rows = view::content(a.as_deref(), b.as_deref(), &e.kind, self.pos.diff);
-            if let Some(rev) = &self.pos.revision {
-                let git = crate::git::body(&self.root, &e.path, rev)?;
-                self.rows = if self.pos.diff {
-                    view::content(Some(&git), b.as_deref(), "M", true)
-                } else {
-                    view::content(None, Some(&git), "B", false)
-                };
+            let kind = if let Some(rev) = &self.pos.revision {
+                a = Some(crate::git::body(&self.root, &e.path, rev)?);
                 self.source = format!("Git {}", &rev[..rev.len().min(8)]);
+                "M"
+            } else {
+                &e.kind
+            };
+            self.comparison_note = match (kind, a.as_deref(), b.as_deref()) {
+                ("B", _, _) => Some("首次记录，没有上一版本"),
+                (_, Some(old), Some(new)) if old == new => Some("两个版本的正文一致"),
+                ("A", None, Some(_)) | ("D", Some(_), None) | (_, Some(_), Some(_)) => None,
+                _ => Some("缺少可对比的文本快照"),
+            };
+            self.pos.diff &= self.comparison_note.is_none();
+            let (before, after, visible_kind) = if !self.pos.diff && self.pos.revision.is_some() {
+                (None, a.as_deref(), "B")
+            } else if !self.pos.diff && self.comparison_note.is_some() && matches!(kind, "O" | "R")
+            {
+                (None, b.as_deref(), "B")
+            } else {
+                (a.as_deref(), b.as_deref(), kind)
+            };
+            self.rows = view::content(before, after, visible_kind, self.pos.diff);
+            self.syntax = Syntax::parse(&e.path, after);
+            if self.pos.diff {
+                self.old_syntax = Syntax::parse(&e.path, before);
             }
-            if e.kind == "R" {
+            self.changes
+                .extend(self.rows.iter().enumerate().filter_map(|(i, r)| {
+                    (r.change.is_some() && (i == 0 || r.change != self.rows[i - 1].change))
+                        .then_some(i)
+                }));
+            if e.kind == "R" && self.pos.revision.is_none() {
                 let prev: String =
                     self.db
                         .query_row("SELECT previous FROM moves WHERE id=?", [e.id], |r| {
@@ -162,24 +197,98 @@ impl App {
                         })?;
                 self.source = format!("{prev} → {}", e.path);
             }
-            if e.kind == "O" {
+            if e.kind == "O" && self.pos.revision.is_none() {
                 self.source = "离线期间变更".into();
             }
             if locate {
-                self.pos.line = self
-                    .rows
-                    .iter()
-                    .position(|r| {
-                        if self.pos.mode > 0 && !self.pos.query.is_empty() {
-                            r.text.contains(&self.pos.query)
-                        } else {
-                            r.mark != ' '
-                        }
-                    })
-                    .unwrap_or(0);
+                self.pos.line = if self.pos.mode > 0 && !self.pos.query.is_empty() {
+                    self.rows
+                        .iter()
+                        .position(|r| r.text.contains(&self.pos.query))
+                        .unwrap_or(0)
+                } else {
+                    self.changes.first().copied().unwrap_or(0)
+                };
+                self.pos.top = self.pos.line.saturating_sub(3);
             }
         }
+        self.pos.line = self.pos.line.min(self.rows.len().saturating_sub(1));
         Ok(())
+    }
+
+    fn toggle_diff(&mut self) -> Result<()> {
+        if self.pos.entry.is_none() {
+            self.notice = Some("请先选择一个文件");
+            return Ok(());
+        }
+        if let Some(note) = self.comparison_note {
+            self.notice = Some(note);
+            return Ok(());
+        }
+        let anchor = self
+            .rows
+            .get(self.pos.line)
+            .map(|r| (r.num, r.mark, r.change));
+        self.pos.diff = !self.pos.diff;
+        self.load(false)?;
+        if let Some((num, mark, change)) = anchor {
+            let start = change.and_then(|c| self.changes.get(c - 1).copied());
+            let exact = || {
+                self.rows.iter().position(|r| {
+                    num > 0
+                        && r.num == num
+                        && r.change == change
+                        && (mark == '-') == (r.mark == '-')
+                })
+            };
+            self.pos.line = if self.pos.diff {
+                start.or_else(exact)
+            } else {
+                exact().or(start)
+            }
+            .or_else(|| self.changes.first().copied())
+            .unwrap_or(0);
+            self.pos.top = self.pos.line.saturating_sub(3);
+        }
+        Ok(())
+    }
+
+    fn jump_change(&mut self, forward: bool) {
+        let target = if forward {
+            self.changes
+                .get(self.changes.partition_point(|&i| i <= self.pos.line))
+        } else {
+            self.changes[..self.changes.partition_point(|&i| i < self.pos.line)].last()
+        };
+        if let Some(&target) = target {
+            self.pos.line = target;
+            self.pos.top = target.saturating_sub(3);
+        } else {
+            self.notice = Some(if self.changes.is_empty() {
+                "当前版本没有可跳转的变化"
+            } else if forward {
+                "已到最后一处变化"
+            } else {
+                "已到第一处变化"
+            });
+        }
+    }
+
+    fn scroll(&mut self, forward: bool, amount: usize, height: usize) {
+        let last = self.rows.len().saturating_sub(1);
+        self.pos.line = if forward {
+            self.pos.line.saturating_add(amount).min(last)
+        } else {
+            self.pos.line.saturating_sub(amount)
+        };
+        if amount > 1 {
+            self.pos.top = if forward {
+                self.pos.top.saturating_add(amount)
+            } else {
+                self.pos.top.saturating_sub(amount)
+            };
+        }
+        self.pos.top = visible_top(self.pos.top, self.pos.line, self.rows.len(), height);
     }
     fn push(&mut self) {
         self.stack.push(Bookmark {
@@ -287,7 +396,10 @@ impl App {
         }
         Ok(())
     }
-    fn key(&mut self, k: K) -> Result<bool> {
+    fn key(&mut self, k: K, size: Size) -> Result<bool> {
+        self.notice = None;
+        let page = size.height.saturating_sub(5).max(1) as usize;
+        let narrow = size.width < 80;
         self.follow = false;
         if matches!(self.panel, Panel::Add) {
             match k {
@@ -398,7 +510,8 @@ impl App {
                 self.panel = Panel::Help;
                 self.options = vec![
                     "↑↓  选择事件或正文行".into(),
-                    "[ ]  上一处 / 下一处变化".into(),
+                    "[ / ]  上一处 / 下一处变化".into(),
+                    "PgUp / PgDn  正文翻页".into(),
                     "z  折叠连续保存     f  当前目录     H  回到起点".into(),
                     "d  切换对比     h  文件历史".into(),
                     "r  引用与定义     i  忽略规则".into(),
@@ -446,13 +559,7 @@ impl App {
                 self.push();
                 self.panel = Panel::Ignore;
                 self.choice = 0;
-                self.options = vec![format!("/{p}")];
-                if let Some((_, ext)) = p.rsplit('/').next().unwrap().rsplit_once('.') {
-                    self.options.push(format!("*.{ext}"))
-                }
-                if let Some((dir, _)) = p.rsplit_once('/') {
-                    self.options.push(format!("/{dir}/"))
-                }
+                self.options = ignore_options(&p);
             }
             K::Char('h') if self.pos.entry.is_some() => {
                 self.push();
@@ -494,37 +601,35 @@ impl App {
                 self.reload(false)?
             }
             K::Char('d') => {
-                let n = self.rows.get(self.pos.line).map(|r| r.num);
-                self.pos.diff = !self.pos.diff;
-                self.load(false)?;
-                if let Some(i) = self.rows.iter().position(|r| Some(r.num) == n) {
-                    self.pos.line = i
+                if narrow
+                    && !self.pos.body
+                    && self.pos.entry.is_some()
+                    && self.comparison_note.is_none()
+                {
+                    self.push();
+                    self.pos.body = true;
                 }
+                self.toggle_diff()?;
             }
             K::Char('[') | K::Char(']') => {
-                let mut iter = (0..self.rows.len()).filter(|&i| {
-                    self.rows[i].mark != ' ' && (i == 0 || self.rows[i - 1].mark == ' ')
-                });
-                let next = if k == K::Char(']') {
-                    iter.find(|i| *i > self.pos.line)
-                } else {
-                    iter.rfind(|i| *i < self.pos.line)
-                };
-                if let Some(i) = next {
-                    self.pos.line = i
+                if narrow && !self.pos.body && !self.changes.is_empty() {
+                    self.push();
+                    self.pos.body = true;
                 }
+                self.jump_change(k == K::Char(']'));
             }
             K::Enter if !self.pos.body => {
                 self.push();
-                self.pos.body = true
+                self.pos.body = true;
             }
-            K::Up | K::Down if self.pos.body => {
-                self.pos.line = if k == K::Up {
-                    self.pos.line.saturating_sub(1)
-                } else {
-                    (self.pos.line + 1).min(self.rows.len().saturating_sub(1))
+            K::PageUp | K::PageDown if self.pos.entry.is_some() => {
+                if !self.pos.body {
+                    self.push();
+                    self.pos.body = true;
                 }
+                self.scroll(k == K::PageDown, page.saturating_sub(1).max(1), page);
             }
+            K::Up | K::Down if self.pos.body => self.scroll(k == K::Down, 1, page),
             K::Up | K::Down => {
                 let i = self
                     .pos
@@ -661,27 +766,30 @@ impl App {
             if wide || self.pos.body {
                 let a = if wide { cols[1] } else { bands[1] };
                 let h = a.height.saturating_sub(2) as usize;
-                let start = self
-                    .pos
-                    .line
-                    .saturating_sub(3)
-                    .min(self.rows.len().saturating_sub(h));
-                let mut lines = vec![Line::styled(
-                    format!(
-                        " {}  ·  {}",
-                        if self.pos.diff {
-                            "版本对比"
-                        } else {
-                            "版本正文"
-                        },
-                        if self.source.is_empty() {
-                            "来源未知"
-                        } else {
-                            &self.source
+                let start = visible_top(self.pos.top, self.pos.line, self.rows.len(), h);
+                let previous = self.changes.partition_point(|&row| row <= self.pos.line);
+                let mut summary = if self.pos.diff {
+                    let base = if self.pos.revision.is_some() {
+                        "Git"
+                    } else {
+                        match self.pos.entry.as_ref().map(|e| e.kind.as_str()) {
+                            Some("A") => "空文件",
+                            _ => "上一版",
                         }
-                    ),
-                    Style::new().fg(DIM),
-                )];
+                    };
+                    format!(" 对比 · {base} → 本次")
+                } else {
+                    " 正文".to_string()
+                };
+                if !self.changes.is_empty() {
+                    summary.push_str(&format!("  [{} / {}] 变化", previous, self.changes.len()));
+                } else if let Some(note) = self.comparison_note {
+                    summary.push_str(&format!("  ·  {note}"));
+                }
+                if !self.source.is_empty() {
+                    summary.push_str(&format!("  ·  {}", self.source));
+                }
+                let mut lines = vec![Line::styled(summary, Style::new().fg(ACC))];
                 for (i, r) in self.rows.iter().enumerate().skip(start).take(h) {
                     let color = match r.mark {
                         '~' => Color::Yellow,
@@ -689,26 +797,31 @@ impl App {
                         '-' => Color::Red,
                         _ => DIM,
                     };
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            format!(
-                                "{} {} {:>4}  ",
-                                if self.pos.body && i == self.pos.line {
-                                    "›"
-                                } else {
-                                    " "
-                                },
-                                r.mark,
-                                if r.num == 0 {
-                                    String::new()
-                                } else {
-                                    r.num.to_string()
-                                }
-                            ),
-                            Style::new().fg(color),
-                        ),
-                        Span::raw(r.text.replace('\t', "    ")),
-                    ]));
+                    let anchored =
+                        i == self.pos.line && (self.pos.body || !self.changes.is_empty());
+                    let gutter = format!(
+                        "{} {} {:>4}  ",
+                        if anchored { "›" } else { " " },
+                        r.mark,
+                        if r.num == 0 {
+                            String::new()
+                        } else {
+                            r.num.to_string()
+                        }
+                    );
+                    let syntax = if self.pos.diff && r.mark == '-' {
+                        &self.old_syntax
+                    } else {
+                        &self.syntax
+                    };
+                    let mut spans = vec![Span::styled(gutter, Style::new().fg(color))];
+                    spans.extend(syntax.spans(r.num, &r.text));
+                    let line = Line::from(spans);
+                    lines.push(if self.pos.body && anchored {
+                        line.style(Style::new().add_modifier(Modifier::BOLD))
+                    } else {
+                        line
+                    });
                 }
                 f.render_widget(
                     Paragraph::new(lines).block(
@@ -801,13 +914,48 @@ impl App {
             )
         } else if !main {
             "↑↓ 选择   Enter 确定   Esc 返回".into()
+        } else if let Some(notice) = self.notice {
+            notice.into()
         } else if self.pos.body {
-            "↑↓ 阅读   [ ] 变化   d 对比   r 引用   Esc 返回".into()
+            format!(
+                "↑↓  PgUp/PgDn 翻页  [ / ] 变化  d {}  r 引用  Esc 返回",
+                if self.pos.diff { "正文" } else { "对比" }
+            )
         } else {
-            "↑↓ 预览   Enter 阅读   / 搜索   t 视图   ? 帮助".into()
+            "↑↓ 事件  Enter 阅读  [ / ] 变化  d 对比  / 搜索  ? 帮助".into()
         };
         f.render_widget(Paragraph::new(hint).style(Style::new().fg(ACC)), bands[2]);
     }
+}
+fn visible_top(top: usize, line: usize, rows: usize, height: usize) -> usize {
+    let height = height.max(1);
+    top.clamp(line.saturating_add(1).saturating_sub(height), line)
+        .min(rows.saturating_sub(height))
+}
+
+fn ignore_options(path: &str) -> Vec<String> {
+    fn escape_glob(path: &str) -> String {
+        let mut escaped = String::with_capacity(path.len());
+        for ch in path.chars() {
+            if matches!(ch, '\\' | '*' | '?' | '[' | ']' | '{' | '}' | ' ') {
+                escaped.push('\\');
+            }
+            escaped.push(ch);
+        }
+        escaped
+    }
+    let mut options = vec![format!("/{}", escape_glob(path))];
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if let Some((stem, ext)) = name.rsplit_once('.')
+        && !stem.is_empty()
+        && !ext.is_empty()
+    {
+        options.push(format!("*.{}", escape_glob(ext)));
+    }
+    for (end, _) in path.rmatch_indices('/') {
+        options.push(format!("/{}/", escape_glob(&path[..end])));
+    }
+    options
 }
 struct Restore;
 impl Drop for Restore {
@@ -831,6 +979,11 @@ pub fn run(db: Connection, root: String) -> Result<()> {
         pos: Position::default(),
         list: vec![],
         rows: vec![],
+        syntax: Syntax::default(),
+        old_syntax: Syntax::default(),
+        changes: vec![],
+        comparison_note: None,
+        notice: None,
         source: String::new(),
         stack: vec![],
         panel: Panel::Main,
@@ -867,7 +1020,7 @@ pub fn run(db: Connection, root: String) -> Result<()> {
             match event::read()? {
                 Event::Key(k) if k.kind != KeyEventKind::Release => {
                     if (k.code == K::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL))
-                        || a.key(k.code)?
+                        || a.key(k.code, term.size()?)?
                     {
                         break;
                     }
@@ -879,4 +1032,48 @@ pub fn run(db: Connection, root: String) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ignore_menu_lists_every_parent_and_preserves_literal_path() -> Result<()> {
+        let rules = ignore_options("apps/SDK [Beta]/src/internal/config.java");
+        assert_eq!(
+            rules,
+            [
+                "/apps/SDK\\ \\[Beta\\]/src/internal/config.java",
+                "*.java",
+                "/apps/SDK\\ \\[Beta\\]/src/internal/",
+                "/apps/SDK\\ \\[Beta\\]/src/",
+                "/apps/SDK\\ \\[Beta\\]/",
+                "/apps/",
+            ]
+        );
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(".");
+        builder.add_line(None, &rules[4])?;
+        let matcher = builder.build()?;
+        assert!(
+            matcher
+                .matched_path_or_any_parents("apps/SDK [Beta]/sibling.txt", false)
+                .is_ignore()
+        );
+        assert!(
+            !matcher
+                .matched_path_or_any_parents("apps/SDK B/sibling.txt", false)
+                .is_ignore()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn viewport_keeps_cursor_visible_after_paging_or_resize() {
+        assert_eq!(visible_top(23, 26, 100, 24), 23);
+        assert_eq!(visible_top(23, 50, 100, 24), 27);
+        assert_eq!(visible_top(23, 2, 100, 24), 2);
+        assert_eq!(visible_top(97, 99, 100, 24), 76);
+        assert_eq!(visible_top(5, 3, 4, 24), 0);
+    }
 }
