@@ -1,4 +1,5 @@
 mod agent_setup;
+mod clipboard;
 use crate::{
     agent::{self, Brand, Identity, InboxWorker, Mark, Session},
     git::{StatusMonitor, Statuses},
@@ -2340,13 +2341,18 @@ pub fn run(db: Connection, root: String) -> Result<()> {
         }
         a.view_tick(size);
         a.agent_tick();
+        a.poll_hook_copy();
         if a.dirty {
             term.draw(|f| a.draw(f))?;
             a.dirty = false;
         }
         let poll_ms = if a.views.transition.is_some() || a.views.wanted {
             24
-        } else if a.references.is_some() || a.views.refresh.is_some() || a.activity.task.is_some() {
+        } else if a.references.is_some()
+            || a.views.refresh.is_some()
+            || a.activity.task.is_some()
+            || a.hook_copy_pending()
+        {
             35
         } else {
             250

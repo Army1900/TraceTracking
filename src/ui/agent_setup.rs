@@ -13,6 +13,7 @@ pub(super) struct AgentSetup {
     draft: agent::Focus,
     from_sessions: bool,
     form: CustomTool,
+    copy_result: Option<mpsc::Receiver<bool>>,
 }
 
 #[derive(Default)]
@@ -83,6 +84,7 @@ impl App {
             draft: self.activity.focus.clone().unwrap_or_default(),
             from_sessions,
             form: CustomTool::default(),
+            copy_result: None,
         });
         self.panel = Panel::AgentSetup;
         self.setup_options(None);
@@ -210,10 +212,64 @@ impl App {
                     _ => {}
                 }
             }
-            Panel::AgentHook if matches!(key, K::Enter | K::Esc) => self.panel = Panel::AgentSetup,
+            Panel::AgentHook => match key {
+                K::Char('c') => self.copy_hook(),
+                K::Enter | K::Esc => {
+                    self.activity
+                        .setup
+                        .as_mut()
+                        .expect("hook panel")
+                        .copy_result = None;
+                    self.panel = Panel::AgentSetup;
+                }
+                _ => {}
+            },
             _ => {}
         }
         Ok(())
+    }
+
+    fn copy_hook(&mut self) {
+        let setup = self.activity.setup.as_mut().expect("hook panel");
+        if setup.copy_result.is_none()
+            && let Some(tool) = self.options.get(self.choice)
+        {
+            let text = hook_sample(tool, &self.root);
+            let (send, receive) = mpsc::channel();
+            setup.copy_result = Some(receive);
+            std::thread::spawn(move || {
+                let _ = send.send(clipboard::copy(&text));
+            });
+        }
+        self.notice = Some("复制中…");
+    }
+
+    pub(super) fn hook_copy_pending(&self) -> bool {
+        self.activity
+            .setup
+            .as_ref()
+            .is_some_and(|setup| setup.copy_result.is_some())
+    }
+
+    pub(super) fn poll_hook_copy(&mut self) {
+        let Some(setup) = &mut self.activity.setup else {
+            return;
+        };
+        let Some(result) = &setup.copy_result else {
+            return;
+        };
+        let copied = match result.try_recv() {
+            Ok(copied) => copied,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => false,
+        };
+        setup.copy_result = None;
+        self.notice = Some(if copied {
+            "已复制到剪贴板"
+        } else {
+            "无法写入剪贴板"
+        });
+        self.dirty = true;
     }
 
     pub(super) fn draw_agent_setup(&self, f: &mut Frame, panes: [Rect; 3]) {
@@ -286,16 +342,20 @@ impl App {
             }
             Panel::AgentHook => {
                 let tool = self.options.get(self.choice).map_or("", String::as_str);
+                let sample = Line::styled(
+                    terminal_text(&hook_sample(tool, &self.root)),
+                    Style::new().fg(ACC),
+                );
                 let lines = match tool {
                     "claude-code" => vec![
-                        Line::from("tt ai-hook-config claude-code"),
+                        sample,
                         Line::styled(
                             "把生成的片段合并到 .claude/settings.local.json。",
                             Style::new().fg(DIM),
                         ),
                     ],
                     "codex" => vec![
-                        Line::from("tt ai-hook-config codex"),
+                        sample,
                         Line::styled(
                             "把生成的片段合并到 .codex/hooks.json，在 Codex 中确认。",
                             Style::new().fg(DIM),
@@ -303,21 +363,14 @@ impl App {
                     ],
                     _ => vec![
                         Line::from("让自己的 Hook 把一条 JSON 写到 tt ai-event 的 stdin。"),
-                        Line::styled(
-                            serde_json::json!({
-                                "version":1, "tool":tool, "session_id":"session-1",
-                                "cwd":"/path/to/project", "phase":"session_start"
-                            })
-                            .to_string(),
-                            Style::new().fg(ACC),
-                        ),
+                        sample,
                         Line::from(
                             "文件操作发送 write_start / write_finish，并带同一 call_id 和 files。",
                         ),
                         Line::styled("完整字段见 README 的「自定义工具」。", Style::new().fg(DIM)),
                     ],
                 };
-                ("Hook 接入", lines, "Enter 或 Esc 返回关注设置")
+                ("Hook 接入", lines, "c 复制  Enter 或 Esc 返回")
             }
             _ => return,
         };
@@ -329,10 +382,28 @@ impl App {
             panel.wrap(Wrap { trim: false })
         };
         f.render_widget(panel, area);
-        f.render_widget(
-            Paragraph::new(controls).style(Style::new().fg(ACC)),
-            panes[2],
-        );
+        let footer = if matches!(self.panel, Panel::AgentHook)
+            && let Some(notice) = self.notice
+        {
+            format!("{notice}  ·  {controls}")
+        } else {
+            controls.into()
+        };
+        f.render_widget(Paragraph::new(footer).style(Style::new().fg(ACC)), panes[2]);
+    }
+}
+
+fn hook_sample(tool: &str, root: &str) -> String {
+    match tool {
+        "claude-code" | "codex" => format!("tt ai-hook-config {tool}"),
+        _ => serde_json::json!({
+            "version": 1,
+            "tool": tool,
+            "session_id": "session-1",
+            "cwd": root,
+            "phase": "session_start",
+        })
+        .to_string(),
     }
 }
 
