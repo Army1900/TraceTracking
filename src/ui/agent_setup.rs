@@ -13,7 +13,6 @@ pub(super) struct AgentSetup {
     draft: agent::Focus,
     from_sessions: bool,
     form: CustomTool,
-    copy_result: Option<mpsc::Receiver<bool>>,
 }
 
 #[derive(Default)]
@@ -84,7 +83,6 @@ impl App {
             draft: self.activity.focus.clone().unwrap_or_default(),
             from_sessions,
             form: CustomTool::default(),
-            copy_result: None,
         });
         self.panel = Panel::AgentSetup;
         self.setup_options(None);
@@ -213,15 +211,16 @@ impl App {
                 }
             }
             Panel::AgentHook => match key {
-                K::Char('c') => self.copy_hook(),
-                K::Enter | K::Esc => {
-                    self.activity
-                        .setup
-                        .as_mut()
-                        .expect("hook panel")
-                        .copy_result = None;
-                    self.panel = Panel::AgentSetup;
+                K::Char('c') => self.copy_hook(None),
+                K::Char('2')
+                    if self
+                        .options
+                        .get(self.choice)
+                        .is_some_and(|tool| tool == "opencode") =>
+                {
+                    self.copy_hook(Some("opencode-v2"));
                 }
+                K::Enter | K::Esc => self.panel = Panel::AgentSetup,
                 _ => {}
             },
             _ => {}
@@ -229,47 +228,11 @@ impl App {
         Ok(())
     }
 
-    fn copy_hook(&mut self) {
-        let setup = self.activity.setup.as_mut().expect("hook panel");
-        if setup.copy_result.is_none()
-            && let Some(tool) = self.options.get(self.choice)
-        {
-            let text = hook_sample(tool, &self.root);
-            let (send, receive) = mpsc::channel();
-            setup.copy_result = Some(receive);
-            std::thread::spawn(move || {
-                let _ = send.send(clipboard::copy(&text));
-            });
+    fn copy_hook(&mut self, variant: Option<&str>) {
+        if let Some(tool) = self.options.get(self.choice) {
+            let text = hook_sample(variant.unwrap_or(tool), &self.root);
+            self.copy_text(text);
         }
-        self.notice = Some("复制中…");
-    }
-
-    pub(super) fn hook_copy_pending(&self) -> bool {
-        self.activity
-            .setup
-            .as_ref()
-            .is_some_and(|setup| setup.copy_result.is_some())
-    }
-
-    pub(super) fn poll_hook_copy(&mut self) {
-        let Some(setup) = &mut self.activity.setup else {
-            return;
-        };
-        let Some(result) = &setup.copy_result else {
-            return;
-        };
-        let copied = match result.try_recv() {
-            Ok(copied) => copied,
-            Err(mpsc::TryRecvError::Empty) => return,
-            Err(mpsc::TryRecvError::Disconnected) => false,
-        };
-        setup.copy_result = None;
-        self.notice = Some(if copied {
-            "已复制到剪贴板"
-        } else {
-            "无法写入剪贴板"
-        });
-        self.dirty = true;
     }
 
     pub(super) fn draw_agent_setup(&self, f: &mut Frame, panes: [Rect; 3]) {
@@ -361,6 +324,28 @@ impl App {
                             Style::new().fg(DIM),
                         ),
                     ],
+                    "opencode" => vec![
+                        sample,
+                        Line::styled(
+                            "把生成的插件保存到 .opencode/plugins/tracetracking.ts。",
+                            Style::new().fg(DIM),
+                        ),
+                        Line::from("OpenCode 2 用 tt ai-hook-config opencode-v2 生成。"),
+                    ],
+                    "pi" => vec![
+                        sample,
+                        Line::styled(
+                            "把生成的扩展保存到 .pi/extensions/tracetracking.ts。",
+                            Style::new().fg(DIM),
+                        ),
+                    ],
+                    "dsh" => vec![
+                        sample,
+                        Line::styled(
+                            "把生成的 JSON 保存为单独文件，配置到 DSH Claude Code Hook 桥接插件的 configPath。",
+                            Style::new().fg(DIM),
+                        ),
+                    ],
                     _ => vec![
                         Line::from("让自己的 Hook 把一条 JSON 写到 tt ai-event 的 stdin。"),
                         sample,
@@ -370,7 +355,12 @@ impl App {
                         Line::styled("完整字段见 README 的「自定义工具」。", Style::new().fg(DIM)),
                     ],
                 };
-                ("Hook 接入", lines, "c 复制  Enter 或 Esc 返回")
+                let controls = if tool == "opencode" {
+                    "c 复制 V1  2 复制 V2  Esc 返回"
+                } else {
+                    "c 复制  Enter 或 Esc 返回"
+                };
+                ("Hook 接入", lines, controls)
             }
             _ => return,
         };
@@ -395,7 +385,9 @@ impl App {
 
 fn hook_sample(tool: &str, root: &str) -> String {
     match tool {
-        "claude-code" | "codex" => format!("tt ai-hook-config {tool}"),
+        "claude-code" | "codex" | "opencode" | "opencode-v2" | "pi" | "dsh" => {
+            format!("tt ai-hook-config {tool}")
+        }
         _ => serde_json::json!({
             "version": 1,
             "tool": tool,

@@ -273,13 +273,22 @@ pub struct Entry {
     pub stamp: i64,
     pub agent: Option<crate::agent::Mark>,
 }
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum SearchMode {
+    #[default]
+    Path,
+    Body,
+    Changes,
+    PathOrBody,
+}
+
 #[derive(Default)]
 pub struct EntryQuery<'a> {
     pub root: &'a str,
     pub recent: bool,
     pub only: &'a str,
     pub text: &'a str,
-    pub mode: usize,
+    pub mode: SearchMode,
     pub offset: usize,
     pub session: Option<i64>,
     pub git_status: Option<Arc<crate::git::Statuses>>,
@@ -343,7 +352,10 @@ pub fn entries(db: &Connection, query: EntryQuery<'_>) -> Result<Vec<Entry>> {
             .any(|r| r.mark != ' ' && r.text.contains(&q)))
         },
     )?;
-    let current_files = ((recent && git_paths.is_none()) || mode == 1) && session.is_none();
+    let recent = recent && mode != SearchMode::Changes;
+    let current_files = ((recent && git_paths.is_none())
+        || matches!(mode, SearchMode::Body | SearchMode::PathOrBody))
+        && session.is_none();
     let table = if current_files {
         "files f JOIN events e ON f.id=e.id"
     } else {
@@ -363,11 +375,14 @@ pub fn entries(db: &Connection, query: EntryQuery<'_>) -> Result<Vec<Entry>> {
         (true, false, ..) => ("json_each(?6) git CROSS JOIN ", "AND e.path=git.value"),
     };
     let pred = match mode {
-        1 => "instr((SELECT body FROM blobs WHERE hash=e.new),?3)>0",
-        2 => {
+        SearchMode::Body => "instr((SELECT body FROM blobs WHERE hash=e.new),?3)>0",
+        SearchMode::Changes => {
             "e.kind!='B' AND EXISTS(SELECT 1 FROM blobs WHERE hash IN(e.old,e.new) AND instr(body,?3)>0) AND changed_text((SELECT body FROM blobs WHERE hash=e.old),(SELECT body FROM blobs WHERE hash=e.new),?3)"
         }
-        _ => "instr(lower(e.path),lower(?3))>0",
+        SearchMode::Path => "instr(lower(e.path),lower(?3))>0",
+        SearchMode::PathOrBody => {
+            "(instr(lower(e.path),lower(?3))>0 OR instr((SELECT body FROM blobs WHERE hash=e.new),?3)>0)"
+        }
     };
     let session_filter = crate::agent::session_condition();
     let recent_filter = if recent && session.is_some() {

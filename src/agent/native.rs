@@ -10,7 +10,7 @@ fn string<'a>(value: &'a Value, name: &str) -> Option<&'a str> {
 
 pub(super) fn translate(tool: &str, payload: Value) -> Result<Option<Receipt>> {
     ensure!(
-        matches!(tool, "claude-code" | "codex"),
+        matches!(tool, "claude-code" | "codex" | "opencode" | "pi" | "dsh"),
         "未知的原生 AI 适配器"
     );
     let phase = match string(&payload, "hook_event_name") {
@@ -24,6 +24,9 @@ pub(super) fn translate(tool: &str, payload: Value) -> Result<Option<Receipt>> {
     };
     let cwd = string(&payload, "cwd").context("Hook 缺少 cwd")?;
     let session_id = string(&payload, "session_id").context("Hook 缺少 session_id")?;
+    if session_id.is_empty() {
+        return Ok(None);
+    }
     let mut receipt = Receipt {
         version: 1,
         tool: tool.into(),
@@ -46,27 +49,21 @@ pub(super) fn translate(tool: &str, payload: Value) -> Result<Option<Receipt>> {
         let action = string(&payload, "tool_name").unwrap_or("");
         let input = &payload["tool_input"];
         receipt.files = match (tool, action) {
-            ("claude-code", "Write" | "Edit") => {
-                let Some(path) = string(input, "file_path") else {
+            ("claude-code" | "dsh", "Write" | "Edit")
+            | ("opencode" | "pi" | "dsh", "write" | "edit")
+            | ("opencode", "multiedit") => {
+                let Some(file) = text_write(tool, action, Path::new(cwd), input, phase)? else {
                     return Ok(None);
                 };
-                let path = absolute(Path::new(cwd), Path::new(path))?;
-                let mut file = capture(&path, phase)?;
-                if action == "Write"
-                    && let Some(content) = string(input, "content")
-                {
-                    file.expected_after = Some(store::digest(content.as_bytes()));
-                } else if action == "Edit"
-                    && phase == Phase::WriteStart
-                    && let Some((before, after)) = expected_edit(&path, input)
-                {
-                    file.before = Some(before);
-                    file.expected_after = Some(after);
-                }
                 vec![file]
             }
-            ("codex", "apply_patch") => {
-                let Some(patch) = string(input, "command") else {
+            ("codex" | "opencode", "apply_patch") => {
+                let key = if tool == "codex" {
+                    "command"
+                } else {
+                    "patchText"
+                };
+                let Some(patch) = string(input, key) else {
                     return Ok(None);
                 };
                 patch_files(Path::new(cwd), patch, phase)?
@@ -78,6 +75,46 @@ pub(super) fn translate(tool: &str, payload: Value) -> Result<Option<Receipt>> {
         }
     }
     Ok(Some(receipt))
+}
+
+fn text_write(
+    tool: &str,
+    action: &str,
+    cwd: &Path,
+    input: &Value,
+    phase: Phase,
+) -> Result<Option<FileReceipt>> {
+    let key = match tool {
+        "opencode" => "filePath",
+        "pi" => "path",
+        _ => "file_path",
+    };
+    let Some(path) = string(input, key).filter(|path| !path.is_empty()) else {
+        return Ok(None);
+    };
+    let path = if tool == "pi" {
+        path.strip_prefix('@').unwrap_or(path)
+    } else {
+        path
+    };
+    let path = if let Some(relative) = path.strip_prefix("~/") {
+        dirs::home_dir().context("找不到用户目录")?.join(relative)
+    } else {
+        Path::new(path).to_path_buf()
+    };
+    let path = absolute(cwd, &path)?;
+    let mut file = capture(&path, phase)?;
+    if matches!(action, "Write" | "write")
+        && let Some(content) = string(input, "content")
+    {
+        file.expected_after = Some(store::digest(content.as_bytes()));
+    } else if phase == Phase::WriteStart
+        && let Some((before, after)) = expected_edit(&path, tool, input)
+    {
+        file.before = Some(before);
+        file.expected_after = Some(after);
+    }
+    Ok(Some(file))
 }
 
 fn capture(path: &Path, phase: Phase) -> Result<FileReceipt> {
@@ -107,25 +144,44 @@ fn small_text(path: &Path) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-fn expected_edit(path: &Path, input: &Value) -> Option<(String, String)> {
-    let body = small_text(path)?;
-    let old = string(input, "old_string")?;
-    let new = string(input, "new_string")?;
-    if old.is_empty() {
-        return None;
-    }
-    let positions = body.match_indices(old).count();
-    let expected = if input["replace_all"].as_bool() == Some(true) && positions > 0 {
-        body.replace(old, new)
-    } else if positions == 1 {
-        body.replacen(old, new, 1)
-    } else {
-        return None;
+fn expected_edit(path: &Path, tool: &str, input: &Value) -> Option<(String, String)> {
+    let mut body = small_text(path)?;
+    let before = store::digest(body.as_bytes());
+    let (old_key, new_key, all_key) = match tool {
+        "opencode" => ("oldString", "newString", "replaceAll"),
+        "pi" => ("oldText", "newText", "replaceAll"),
+        _ => ("old_string", "new_string", "replace_all"),
     };
-    Some((
-        store::digest(body.as_bytes()),
-        store::digest(expected.as_bytes()),
-    ))
+    let edits = input["edits"]
+        .as_array()
+        .map_or(std::slice::from_ref(input), Vec::as_slice);
+    for edit in edits {
+        let old = string(edit, old_key)?;
+        let new = string(edit, new_key)?;
+        if old.is_empty() {
+            return None;
+        }
+        let mut positions = body.match_indices(old);
+        let (index, _) = positions.next()?;
+        let all = edit[all_key].as_bool() == Some(true);
+        let count = if all {
+            1 + positions.count()
+        } else if positions.next().is_none() {
+            1
+        } else {
+            return None;
+        };
+        let remaining = body.len() - old.len() * count;
+        if new.len().checked_mul(count)?.checked_add(remaining)? as u64 > store::LIMIT {
+            return None;
+        }
+        if all {
+            body = body.replace(old, new);
+        } else {
+            body.replace_range(index..index + old.len(), new);
+        }
+    }
+    Some((before, store::digest(body.as_bytes())))
 }
 
 fn patch_files(cwd: &Path, patch: &str, phase: Phase) -> Result<Vec<FileReceipt>> {

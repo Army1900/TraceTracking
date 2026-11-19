@@ -20,7 +20,7 @@ fn main() -> Result<()> {
     let args: Vec<_> = env::args().skip(1).collect();
     if args.first().is_some_and(|s| s == "--help" || s == "-h") {
         println!(
-            "TraceTracking · 项目变更浏览器\n\n tt [目录]                 打开项目\n tt add <目录>             注册项目\n tt watch <目录>           持续记录（无界面）\n tt hook <目录> <路径> <来源>   写入成功后记录来源\n tt ai-hook <工具>          从 stdin 接收 Claude Code / Codex Hook\n tt ai-event               从 stdin 接收统一 AI 事件\n tt ai-hook-config <工具>   输出可选的 Hook 配置\n tt ignore <目录> <规则>    添加忽略规则\n tt unignore <目录> <规则>  移除忽略规则"
+            "TraceTracking · 项目变更浏览器\n\n tt [目录]                 打开项目\n tt add <目录>             注册项目\n tt watch <目录>           持续记录（无界面）\n tt hook <目录> <路径> <来源>   写入成功后记录来源\n tt ai-hook <工具>          从 stdin 接收 AI 工具 Hook\n tt ai-event               从 stdin 接收统一 AI 事件\n tt ai-hook-config <工具>   输出可选的 Hook 配置或插件源码\n tt ignore <目录> <规则>    添加忽略规则\n tt unignore <目录> <规则>  移除忽略规则"
         );
         return Ok(());
     }
@@ -29,7 +29,9 @@ fn main() -> Result<()> {
         Some("ai-event") if args.len() == 1 => return agent::capture(None),
         Some("ai-hook-config") if args.len() == 2 => return agent::hook_config(&args[1]),
         Some("ai-hook" | "ai-event" | "ai-hook-config") => {
-            bail!("使用 tt ai-hook <claude-code|codex> 或 tt ai-event")
+            bail!(
+                "使用 tt ai-hook <claude-code|codex|opencode|pi|dsh>、tt ai-event 或 tt ai-hook-config <工具>"
+            )
         }
         _ => {}
     }

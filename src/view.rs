@@ -72,10 +72,20 @@ pub fn content(old: Option<&str>, new: Option<&str>, kind: &str, diff: bool) -> 
     rows
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TextPoint {
     pub row: usize,
     pub byte: usize,
+}
+
+pub fn cell_width(grapheme: &str) -> usize {
+    if grapheme == "\t" {
+        4
+    } else if grapheme.chars().any(char::is_control) {
+        crate::syntax::terminal_text(grapheme).width()
+    } else {
+        grapheme.width()
+    }
 }
 
 impl TextPoint {
@@ -112,13 +122,7 @@ impl WrappedRows {
             }
             let mut used = 0;
             for (byte, cluster) in line.text.grapheme_indices(true) {
-                let columns = if cluster == "\t" {
-                    4
-                } else if cluster.chars().any(char::is_control) {
-                    crate::syntax::terminal_text(cluster).width()
-                } else {
-                    cluster.width()
-                };
+                let columns = cell_width(cluster);
                 if used != 0 && used + columns > width {
                     wrapped.push(row, byte);
                     used = 0;

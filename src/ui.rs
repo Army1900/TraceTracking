@@ -1,10 +1,13 @@
 mod agent_setup;
 mod clipboard;
+mod desktop;
+mod pointer;
+mod search;
 use crate::{
     agent::{self, Brand, Identity, InboxWorker, Mark, Session},
     git::{StatusMonitor, Statuses},
     refs,
-    store::{self, Entry},
+    store::{self, Entry, SearchMode},
     syntax::{Syntax, terminal_text},
     view::{self, Row, TextPoint, WrappedRows},
     watch,
@@ -23,6 +26,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 use rusqlite::{Connection, params};
+use search::SearchHits;
 use std::{
     io::{self, Stdout},
     sync::{
@@ -36,6 +40,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const ACC: Color = Color::Rgb(110, 199, 178);
 const DIM: Color = Color::DarkGray;
+const LINE_GUTTER: usize = 6;
+const DIFF_LOGO_WIDTH: usize = 4;
 #[derive(Clone, Default)]
 struct Position {
     entry: Option<Entry>,
@@ -44,7 +50,8 @@ struct Position {
     folded: bool,
     only: String,
     query: String,
-    mode: usize,
+    mode: SearchMode,
+    path_hit: bool,
     offset: usize,
     line: TextPoint,
     top: TextPoint,
@@ -104,6 +111,7 @@ struct Preview {
     syntax: Syntax,
     old_syntax: Syntax,
     changes: Vec<usize>,
+    hits: SearchHits,
     comparison_note: Option<&'static str>,
     source: String,
 }
@@ -115,7 +123,7 @@ struct ViewKey {
     folded: bool,
     only: String,
     query: String,
-    mode: usize,
+    mode: SearchMode,
     diff: bool,
     session: Option<i64>,
 }
@@ -320,6 +328,8 @@ struct App {
     preview: Preview,
     notice: Option<&'static str>,
     views: ViewSwitch,
+    desktop: desktop::DesktopActions,
+    mouse: pointer::MouseState,
     filename_scroll: Option<FilenameScroll>,
     stack: Vec<Bookmark>,
     panel: Panel,
@@ -329,7 +339,7 @@ struct App {
     groups: Groups,
     raw_count: usize,
     positions: std::collections::HashMap<String, Position>,
-    search: Option<QueryTask<Vec<Entry>>>,
+    search: Option<ViewQuery>,
     references: Option<QueryTask<Vec<refs::Target>>>,
     reference_error: Option<String>,
     search_after: Option<std::time::Instant>,
@@ -371,7 +381,17 @@ impl ViewQuery {
             anyhow::ensure!(!cancelled.load(Ordering::Relaxed), "查询已取消");
             let mut preview = Preview::prepare(db, &root, &mut pos, &groups, locate)?;
             anyhow::ensure!(!cancelled.load(Ordering::Relaxed), "查询已取消");
-            preview.prepare_wrap(width);
+            let logo_width = if pos.diff
+                && pos
+                    .entry
+                    .as_ref()
+                    .is_some_and(|entry| matches!(entry.agent, Some(Mark::Linked(_))))
+            {
+                DIFF_LOGO_WIDTH
+            } else {
+                0
+            };
+            preview.prepare_wrap(width, logo_width);
             Ok(ViewPage {
                 pos,
                 list,
@@ -395,7 +415,7 @@ impl ViewQuery {
 
 fn fold_page(list: &mut Vec<Entry>, pos: &Position) -> Groups {
     let mut groups = Groups::new();
-    if !pos.folded || pos.recent || pos.mode != 0 || !pos.query.is_empty() {
+    if !pos.folded || pos.recent || !pos.query.is_empty() {
         return groups;
     }
     let mut compact: Vec<Entry> = Vec::new();
@@ -434,7 +454,11 @@ impl Position {
             recent: self.recent,
             only: &self.only,
             text: &self.query,
-            mode: self.mode,
+            mode: if self.query.is_empty() {
+                SearchMode::Path
+            } else {
+                self.mode
+            },
             offset: self.offset,
             session: self.session,
             git_status: if self.git_only {
@@ -445,8 +469,19 @@ impl Position {
         }
     }
     fn anchor_row(&mut self, row: usize) {
-        self.line = TextPoint::at_row(row);
-        self.top = TextPoint::at_row(row.saturating_sub(3));
+        self.anchor_point(TextPoint::at_row(row));
+    }
+    fn anchor_point(&mut self, point: TextPoint) {
+        self.path_hit = false;
+        self.line = point;
+        self.top = TextPoint::at_row(point.row.saturating_sub(3));
+    }
+    fn anchor_path(&mut self) {
+        self.anchor_row(0);
+        self.path_hit = true;
+    }
+    fn searches_paths(&self) -> bool {
+        matches!(self.mode, SearchMode::Path | SearchMode::PathOrBody)
     }
 }
 
@@ -511,17 +546,16 @@ impl Preview {
             if e.kind == "O" && pos.revision.is_none() {
                 preview.source = "离线期间变更".into();
             }
+            preview.hits = SearchHits::collect(pos, &e.path, &preview.rows);
+            pos.path_hit &= preview.hits.path;
             if locate {
-                let row = if pos.mode > 0 && !pos.query.is_empty() {
-                    preview
-                        .rows
-                        .iter()
-                        .position(|r| r.text.contains(&pos.query))
-                        .unwrap_or(0)
+                if preview.hits.path {
+                    pos.anchor_path();
+                } else if let Some(point) = preview.hits.first() {
+                    pos.anchor_point(point);
                 } else {
-                    preview.changes.first().copied().unwrap_or(0)
-                };
-                pos.anchor_row(row);
+                    pos.anchor_row(preview.changes.first().copied().unwrap_or(0));
+                }
             }
         }
         let last = preview.rows.len().saturating_sub(1);
@@ -541,9 +575,9 @@ impl Preview {
         Ok(preview)
     }
 
-    fn prepare_wrap(&mut self, pane_width: u16) {
+    fn prepare_wrap(&mut self, pane_width: u16, logo_width: usize) {
         let width = (pane_width as usize)
-            .saturating_sub(self.line_digits + 5)
+            .saturating_sub(self.line_digits + LINE_GUTTER + logo_width)
             .max(1);
         if self.wrap.width != width {
             self.wrap = WrappedRows::new(&self.rows, width);
@@ -644,7 +678,20 @@ impl App {
         }
     }
 
+    fn diff_identity(&self) -> Option<&Identity> {
+        if self.pos.diff
+            && self.pos.revision.is_none()
+            && let Some(entry) = &self.pos.entry
+            && let Some(Mark::Linked(identity)) = self.attribution(entry)
+        {
+            return Some(identity);
+        }
+        None
+    }
+
     fn apply_page(&mut self, mut page: ViewPage, epoch: u64) {
+        self.mouse.clear_text();
+        self.mouse.reset_click();
         page.pos.body = self.pos.body;
         self.pos = page.pos;
         self.list = page.list;
@@ -752,6 +799,7 @@ impl App {
         if !matches!(self.panel, Panel::Main)
             || self.search.is_some()
             || self.search_after.is_some()
+            || self.mouse.selecting()
         {
             return;
         }
@@ -876,6 +924,7 @@ impl App {
     }
 
     fn load(&mut self, locate: bool) -> Result<()> {
+        self.mouse.clear_text();
         self.preview = Preview::prepare(&self.db, &self.root, &mut self.pos, &self.groups, locate)?;
         if let Some(entry) = &self.pos.entry
             && self.activity.inspected.binary_search(&entry.id).is_err()
@@ -900,6 +949,9 @@ impl App {
             .get(self.pos.line.row)
             .map(|r| (r.num, r.mark, r.change));
         self.pos.diff = !self.pos.diff;
+        if !self.pos.query.is_empty() {
+            return self.load(true);
+        }
         self.load(false)?;
         if let Some((num, mark, change)) = anchor {
             let start = change.and_then(|c| self.preview.changes.get(c - 1).copied());
@@ -954,7 +1006,8 @@ impl App {
         if self.preview.rows.is_empty() {
             return;
         }
-        self.preview.prepare_wrap(body.width);
+        let logo_width = self.diff_identity().map_or(0, |_| DIFF_LOGO_WIDTH);
+        self.preview.prepare_wrap(body.width, logo_width);
         let rows = self.preview.wrap.len(&self.preview.rows);
         let advance = |index: usize| {
             if forward {
@@ -974,6 +1027,7 @@ impl App {
             .wrap
             .point(visible_top(top, line, rows, height));
         self.pos.line = self.preview.wrap.point(line);
+        self.pos.path_hit = false;
     }
 
     fn push(&mut self) {
@@ -1107,7 +1161,16 @@ impl App {
     }
 
     fn switch(&mut self, r: String) -> Result<()> {
-        self.positions.insert(self.root.clone(), self.pos.clone());
+        let position = if self.pos.query.is_empty() {
+            &self.pos
+        } else {
+            self.stack
+                .iter()
+                .rev()
+                .find(|bookmark| bookmark.position.query.is_empty())
+                .map_or(&self.pos, |bookmark| &bookmark.position)
+        };
+        self.positions.insert(self.root.clone(), position.clone());
         self.root = r;
         self.views = ViewSwitch::default();
         self.activity.task = None;
@@ -1139,30 +1202,41 @@ impl App {
         self.search_after = Some(std::time::Instant::now() + Duration::from_millis(100));
         self.pos.offset = 0;
     }
-    fn search_tick(&mut self) -> Result<()> {
+    fn searching(&self) -> bool {
+        self.search.is_some() || self.search_after.is_some()
+    }
+    fn search_tick(&mut self, size: Size) {
         if self
             .search_after
             .is_some_and(|when| std::time::Instant::now() >= when)
         {
             self.search_after = None;
-            let root = self.root.clone();
-            let pos = self.pos.clone();
-            let git_status = self.git_status.clone();
-            self.search = Some(QueryTask::start(move |db, _| {
-                store::entries(db, pos.entry_query(&root, &git_status))
-            }));
+            let mut pos = self.pos.clone();
+            pos.diff = pos.mode == SearchMode::Changes && !pos.query.is_empty();
+            self.search = Some(ViewQuery::start(
+                self.root.clone(),
+                pos,
+                self.pos.recent,
+                self.views.epoch,
+                size,
+                self.git_status.clone(),
+                false,
+            ));
         }
-        if let Some(result) = self.search.as_ref().and_then(|s| s.results.try_recv().ok()) {
-            self.search = None;
-            self.list = result?;
-            self.activity.refresh = true;
-            self.views.active_epoch = Some(self.views.epoch);
-            self.group_page();
-            self.pos.entry = self.list.first().cloned();
-            self.load(true)?;
-            self.dirty = true;
+        if let Some((job, result)) = ViewQuery::take_result(&mut self.search) {
+            match result {
+                Ok(page) => self.apply_page(page, job.epoch),
+                Err(_) => {
+                    self.notice = Some("搜索失败，按 Esc 返回");
+                    self.list.clear();
+                    self.pos.entry = None;
+                    self.preview = Preview::default();
+                    self.raw_count = 0;
+                    self.groups.clear();
+                    self.dirty = true;
+                }
+            }
         }
-        Ok(())
     }
     fn move_entry(&mut self, forward: bool) -> Result<bool> {
         if self.views.refilter || self.list.is_empty() {
@@ -1211,6 +1285,14 @@ impl App {
 
     fn mouse(&mut self, event: MouseEvent, area: Rect) -> Result<bool> {
         let pointer = ratatui::layout::Position::new(event.column, event.row);
+        if !matches!(
+            event.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) && matches!(self.panel, Panel::Main | Panel::Search)
+        {
+            return self.file_mouse(event.kind, pointer);
+        }
+        self.mouse.reset_click();
         let [_, content, _] = screen_bands(
             area,
             self.path_lines(area).len() + usize::from(self.activity_visible()),
@@ -1255,6 +1337,17 @@ impl App {
     }
 
     fn key(&mut self, k: K, size: Size) -> Result<bool> {
+        self.mouse.reset_click();
+        if matches!(self.panel, Panel::Main) && k == K::Char('c') && self.copy_selection() {
+            return Ok(false);
+        }
+        if k == K::Esc && self.mouse.clear_text() {
+            self.notice = None;
+            return Ok(false);
+        }
+        if matches!(k, K::Char('t' | 'x' | 'g' | '/')) {
+            self.mouse.clear_text();
+        }
         if k != K::Char('t') {
             self.views.wanted = false;
         }
@@ -1301,7 +1394,16 @@ impl App {
                     self.search_after = None;
                     self.back()?
                 }
-                K::Enter => self.panel = Panel::Main,
+                K::Enter if self.pos.query.is_empty() => self.back()?,
+                K::Enter => {
+                    self.panel = Panel::Main;
+                    if self.search_after.is_some() {
+                        self.search_after = Some(Instant::now());
+                    }
+                }
+                K::Up | K::Down if !self.searching() => {
+                    self.move_entry(k == K::Down)?;
+                }
                 K::Char(c) => {
                     self.pos.query.push(c);
                     self.queue_search()
@@ -1311,8 +1413,12 @@ impl App {
                     self.queue_search()
                 }
                 K::Tab => {
-                    self.pos.mode = (self.pos.mode + 1) % 3;
-                    self.pos.diff = self.pos.mode == 2;
+                    self.pos.mode = match self.pos.mode {
+                        SearchMode::PathOrBody => SearchMode::Path,
+                        SearchMode::Path => SearchMode::Body,
+                        SearchMode::Body => SearchMode::Changes,
+                        SearchMode::Changes => SearchMode::PathOrBody,
+                    };
                     self.queue_search()
                 }
                 _ => {}
@@ -1377,7 +1483,7 @@ impl App {
                         self.pos.recent = false;
                         self.pos.only.clear();
                         self.pos.query.clear();
-                        self.pos.mode = 0;
+                        self.pos.mode = SearchMode::Path;
                         self.pos.offset = 0;
                         self.pos.revision = None;
                         self.pos.body = false;
@@ -1400,6 +1506,9 @@ impl App {
             }
             return Ok(false);
         }
+        if self.searching() && !matches!(k, K::Esc | K::Char('q')) {
+            return Ok(false);
+        }
         match k {
             K::Char('q') => return Ok(true),
             K::Esc => self.back()?,
@@ -1408,9 +1517,11 @@ impl App {
                 self.panel = Panel::Help;
                 self.options = vec![
                     "↑↓  选择事件或正文行".into(),
-                    "[ / ]  上一处 / 下一处变化".into(),
+                    "[ / ]  上一处 / 下一处变化或搜索命中".into(),
                     "PgUp / PgDn  正文翻页".into(),
                     "滚轮  滚动鼠标所在的列表或正文".into(),
+                    "双击文件  用系统默认应用打开".into(),
+                    "拖选正文  c / Ctrl+C / 右键复制".into(),
                     "z  折叠连续保存     f  当前目录     H  回到起点".into(),
                     "d  切换对比     h  文件历史".into(),
                     "r  查引用与定义 · 正文里先用 ↑↓ 选一行".into(),
@@ -1422,12 +1533,20 @@ impl App {
                 self.choice = 0
             }
             K::Char('/') => {
-                self.push();
+                if self.pos.query.is_empty()
+                    || !self
+                        .stack
+                        .last()
+                        .is_some_and(|b| b.position.query.is_empty())
+                {
+                    self.push();
+                }
                 self.panel = Panel::Search;
                 self.pos.query.clear();
+                self.pos.mode = SearchMode::PathOrBody;
                 self.pos.offset = 0;
                 self.pos.body = false;
-                self.reload(false)?
+                self.pos.path_hit = false;
             }
             K::Char('a') => {
                 self.push();
@@ -1519,6 +1638,17 @@ impl App {
                 }
                 self.toggle_diff()?;
             }
+            K::Char('[') | K::Char(']') if !self.pos.query.is_empty() => {
+                self.jump_search(k == K::Char(']'))?;
+                if narrow
+                    && !self.pos.body
+                    && !self.pos.path_hit
+                    && self.preview.hits.first().is_some()
+                {
+                    self.push();
+                    self.pos.body = true;
+                }
+            }
             K::Char('[') | K::Char(']') => {
                 if narrow && !self.pos.body && !self.preview.changes.is_empty() {
                     self.push();
@@ -1563,6 +1693,8 @@ impl App {
         pane_width: usize,
         height: usize,
         index: usize,
+        start: usize,
+        path_query: &str,
     ) -> Vec<Line<'static>> {
         if height == 0 || self.list.is_empty() {
             self.filename_scroll = None;
@@ -1570,9 +1702,6 @@ impl App {
         }
 
         let today = chrono::Local::now().date_naive();
-        let start = index
-            .saturating_sub(height / 2)
-            .min(self.list.len().saturating_sub(height));
         let mut lines = Vec::with_capacity(height.min(self.list.len()));
 
         for (i, e) in self.list.iter().enumerate().skip(start).take(height) {
@@ -1621,33 +1750,31 @@ impl App {
                 .saturating_sub(prefix.width() + count.width() + status_width + badge_width);
             let name = terminal_text(e.path.rsplit('/').next().unwrap_or(&e.path));
             let overflow = name.width() > width;
-            let mut display = if i == index && overflow && width > 1 {
+            let scrolling = i == index && overflow && width > 1;
+            let (name_start, display) = if scrolling {
                 if self
                     .filename_scroll
                     .as_ref()
                     .is_none_or(|scroll| scroll.id != e.id || scroll.width != width)
                 {
-                    self.filename_scroll = Some(FilenameScroll::new(e.id, name, width));
+                    self.filename_scroll = Some(FilenameScroll::new(e.id, name.clone(), width));
                 }
-                self.filename_scroll.as_ref().unwrap().visible().to_owned()
+                let scroll = self.filename_scroll.as_ref().unwrap();
+                (scroll.offset, scroll.visible())
             } else {
                 if i == index {
                     self.filename_scroll = None;
                 }
-                if width == 0 {
-                    String::new()
-                } else if overflow {
-                    format!("{}…", filename_prefix(&name, width - 1))
-                } else {
-                    name
-                }
+                (
+                    0,
+                    if overflow {
+                        filename_prefix(&name, width.saturating_sub(1))
+                    } else {
+                        &name
+                    },
+                )
             };
-            if overflow && (!count.is_empty() || badge.is_some()) {
-                display.extend(std::iter::repeat_n(
-                    ' ',
-                    width.saturating_sub(display.width()),
-                ));
-            }
+            let ellipsis = overflow && !scrolling && width > 0;
             let mut spans = vec![Span::raw(prefix)];
             let mut name_style = Style::default();
             if let Some(status) = git {
@@ -1667,7 +1794,23 @@ impl App {
                     git_style(worktree, false, conflict)
                 };
             }
-            spans.push(Span::styled(display, name_style));
+            search::path_spans(
+                &mut spans,
+                &name,
+                name_start..name_start + display.len(),
+                name_style,
+                path_query,
+                i == index && self.pos.path_hit,
+            );
+            if ellipsis {
+                spans.push(Span::styled("…", name_style));
+            }
+            if overflow && (!count.is_empty() || badge.is_some()) {
+                let space = width.saturating_sub(display.width() + usize::from(ellipsis));
+                if space > 0 {
+                    spans.push(Span::raw(" ".repeat(space)));
+                }
+            }
             spans.push(Span::raw(count));
             if let Some((text, style)) = badge {
                 spans.push(Span::styled(text, style));
@@ -1684,10 +1827,19 @@ impl App {
 
     fn draw(&mut self, f: &mut Frame) {
         let main = matches!(self.panel, Panel::Main | Panel::Search);
+        self.mouse.list = Rect::default();
+        self.mouse.reader = None;
         if !main {
             self.filename_scroll = None;
+            self.mouse.clear_text();
         }
         let path = self.path_lines(f.area());
+        let searching = self.searching();
+        let path_query = if !searching && self.pos.searches_paths() {
+            self.pos.query.to_ascii_lowercase()
+        } else {
+            String::new()
+        };
         let bands = screen_bands(f.area(), path.len() + usize::from(self.activity_visible()));
         let name = std::path::Path::new(&self.root)
             .file_name()
@@ -1720,7 +1872,30 @@ impl App {
                 Style::new().fg(ACC),
             ));
         }
-        heading.extend(path.into_iter().map(Line::raw));
+        if path_query.is_empty() {
+            heading.extend(path.into_iter().map(Line::raw));
+        } else if let Some(entry) = &self.pos.entry {
+            let full_path = terminal_text(&entry.path);
+            let mut from = 0;
+            for row in path {
+                let (text, start) = if full_path[from..].starts_with(&row) {
+                    (&full_path, from)
+                } else {
+                    (&row, 0)
+                };
+                let mut spans = Vec::new();
+                search::path_spans(
+                    &mut spans,
+                    text,
+                    start..start + row.len(),
+                    Style::default(),
+                    &path_query,
+                    self.pos.path_hit,
+                );
+                from += row.len();
+                heading.push(Line::from(spans));
+            }
+        }
         if self.activity_visible() {
             let now = chrono::Utc::now().timestamp_millis();
             let mut row = vec![Span::styled("AI  ", Style::new().fg(DIM))];
@@ -1795,14 +1970,19 @@ impl App {
                     .as_ref()
                     .and_then(|e| self.list.iter().position(|x| x.id == e.id))
                     .unwrap_or(0);
-                let mut lines = self.event_lines(a.width as usize, h, index);
-                if lines.is_empty() && self.pos.git_only && !self.views.refilter {
+                let start = visible_top(self.mouse.list_top, index, self.list.len(), h);
+                self.mouse.list_top = start;
+                self.mouse.list = Rect::new(a.x, a.y.saturating_add(1), a.width, h as u16);
+                let mut lines = self.event_lines(a.width as usize, h, index, start, &path_query);
+                if lines.is_empty() && !self.pos.query.is_empty() && !searching {
+                    lines.push(Line::styled("暂无搜索命中", Style::new().fg(DIM)));
+                } else if lines.is_empty() && self.pos.git_only && !self.views.refilter {
                     lines.push(Line::styled("暂无 Git 变更", Style::new().fg(DIM)));
                 } else if lines.is_empty() && self.pos.session.is_some() {
                     lines.push(Line::styled("暂无已关联变更", Style::new().fg(DIM)));
                 }
                 let mut title = if !self.pos.query.is_empty() {
-                    format!("搜索 · {}", self.pos.query)
+                    format!("搜索 · {}", terminal_text(&self.pos.query))
                 } else if !self.pos.only.is_empty() {
                     format!("历史 · {}", self.pos.only)
                 } else if self.pos.recent {
@@ -1817,7 +1997,7 @@ impl App {
                     let (icon, _) = self.activity.badge(&session.identity);
                     title.push_str(&format!(" · {icon} {}", session.identity.short()));
                 }
-                if self.views.refilter {
+                if self.views.refilter || searching {
                     title.push_str(" · 筛选中");
                 } else if self.pos.git_only {
                     title.push_str(" · Git 变更");
@@ -1839,10 +2019,31 @@ impl App {
             if !body.is_empty() {
                 let a = body;
                 let h = a.height.saturating_sub(2) as usize;
-                self.preview.prepare_wrap(a.width);
+                let logo = self
+                    .diff_identity()
+                    .map(|identity| self.activity.badge(identity));
+                let logo_width = logo.as_ref().map_or(0, |_| DIFF_LOGO_WIDTH);
+                self.preview.prepare_wrap(a.width, logo_width);
                 let total = self.preview.wrap.len(&self.preview.rows);
                 let current = self.preview.wrap.index(self.pos.line);
                 let start = visible_top(self.preview.wrap.index(self.pos.top), current, total, h);
+                let gutter = (self.preview.line_digits + LINE_GUTTER + logo_width)
+                    .min(a.width as usize) as u16;
+                self.mouse.reader = Some(pointer::ReaderViewport {
+                    text: Rect::new(
+                        a.x + gutter,
+                        a.y.saturating_add(2),
+                        a.width - gutter,
+                        h as u16,
+                    ),
+                    first_row: start,
+                });
+                let selection = self.mouse.selected();
+                let attribution = self
+                    .pos
+                    .entry
+                    .as_ref()
+                    .and_then(|entry| self.attribution(entry));
                 let previous = self
                     .preview
                     .changes
@@ -1870,15 +2071,18 @@ impl App {
                     summary.push_str(&format!("  ·  {note}"));
                 }
                 if let Some(entry) = &self.pos.entry {
-                    match self.attribution(entry) {
+                    match attribution {
+                        Some(Mark::Linked(_)) if self.pos.diff => {}
+                        Some(Mark::Possible(_)) if self.pos.diff => {
+                            summary.push_str("  ·  可能相关")
+                        }
                         Some(Mark::Linked(identity)) | Some(Mark::Possible(identity)) => {
                             let (icon, _) = self.activity.badge(identity);
-                            let evidence =
-                                if matches!(self.attribution(entry), Some(Mark::Linked(_))) {
-                                    "写入已关联"
-                                } else {
-                                    "可能相关"
-                                };
+                            let evidence = if matches!(attribution, Some(Mark::Linked(_))) {
+                                "写入已关联"
+                            } else {
+                                "可能相关"
+                            };
                             summary.push_str(&format!(
                                 "  ·  {icon} {} {} {evidence}",
                                 terminal_text(self.activity.name(identity)),
@@ -1919,8 +2123,11 @@ impl App {
                         _ => DIM,
                     };
                     let gutter = if first {
-                        let anchor =
-                            selected && (self.pos.body || !self.preview.changes.is_empty());
+                        let anchor = selected
+                            && !self.pos.path_hit
+                            && (self.pos.body
+                                || !self.preview.changes.is_empty()
+                                || !self.pos.query.is_empty());
                         let number = if row.num == 0 {
                             String::new()
                         } else {
@@ -1933,7 +2140,7 @@ impl App {
                             row.mark
                         )
                     } else {
-                        " ".repeat(self.preview.line_digits + 5)
+                        " ".repeat(self.preview.line_digits + LINE_GUTTER)
                     };
                     let syntax = if self.pos.diff && row.mark == '-' {
                         &self.preview.old_syntax
@@ -1942,7 +2149,32 @@ impl App {
                     };
                     let bytes = self.preview.wrap.range(screen_row, point, row.text.len());
                     let mut spans = vec![Span::styled(gutter, Style::new().fg(color))];
-                    spans.extend(syntax.spans_in(row.num, &row.text, bytes));
+                    if let Some((icon, style)) = &logo {
+                        let hunk_start = first
+                            && row.change.is_some_and(|change| {
+                                self.preview.changes.get(change - 1) == Some(&point.row)
+                            });
+                        let icon = if hunk_start {
+                            filename_prefix(icon, logo_width - 1)
+                        } else {
+                            ""
+                        };
+                        if !icon.is_empty() {
+                            spans.push(Span::styled(icon.to_owned(), *style));
+                        }
+                        spans.push(Span::raw(" ".repeat(logo_width - icon.width())));
+                    }
+                    let mut highlights = if searching || self.pos.query.is_empty() {
+                        Vec::new()
+                    } else {
+                        self.preview.hits.highlights(&self.pos, point.row, &bytes)
+                    };
+                    if row.num != 0
+                        && let Some(selection) = &selection
+                    {
+                        pointer::selection_highlight(&mut highlights, selection, point.row, &bytes);
+                    }
+                    spans.extend(syntax.spans_in(row.num, &row.text, bytes, &highlights));
                     let mut line = Line::from(spans);
                     let mut style = Style::new();
                     if let Some(bg) = diff_background(self.pos.diff, row.mark) {
@@ -1967,6 +2199,8 @@ impl App {
                 if events.is_empty() {
                     draw_transition(f, a, "文件".width() as u16, self.views.transition);
                 }
+            } else {
+                self.mouse.clear_text();
             }
         } else {
             let title = match self.panel {
@@ -2134,9 +2368,14 @@ impl App {
         };
         let hint = if matches!(self.panel, Panel::Search) {
             format!(
-                "/ {}  {}▏   Tab 范围 · Enter 确定",
-                ["路径", "正文", "变更"][self.pos.mode],
-                self.pos.query
+                "/ {}  {}▏   Tab 范围 · Enter 筛选",
+                match self.pos.mode {
+                    SearchMode::PathOrBody => "路径 / 正文",
+                    SearchMode::Path => "路径",
+                    SearchMode::Body => "正文",
+                    SearchMode::Changes => "历史变更",
+                },
+                terminal_text(&self.pos.query)
             )
         } else if matches!(self.panel, Panel::Links) {
             if self.references.is_some() {
@@ -2150,6 +2389,20 @@ impl App {
             "↑↓ 选择   Enter 确定   Esc 返回".into()
         } else if let Some(notice) = self.notice {
             notice.into()
+        } else if self.mouse.selected().is_some() {
+            "c / Ctrl+C / 右键复制  Esc 取消选中".into()
+        } else if searching {
+            "正在筛选 · Esc 返回".into()
+        } else if !self.pos.query.is_empty() {
+            format!(
+                "[ / ] 跳命中  ↑↓ {}  d 对比  Esc {}",
+                if self.pos.body { "正文" } else { "文件" },
+                if self.pos.body {
+                    "返回列表"
+                } else {
+                    "退出搜索"
+                },
+            )
         } else if self.pos.body {
             format!(
                 "↑↓  PgUp/PgDn 翻页  [ / ] 变化  d {}  r 引用{git}  Esc 返回",
@@ -2365,11 +2618,11 @@ pub fn run(db: Connection, root: String) -> Result<()> {
     execute!(io::stdout(), EnterAlternateScreen)?;
     #[cfg(windows)]
     execute!(io::stdout(), crossterm::event::EnableMouseCapture)?;
-    // Track buttons and wheel coordinates on ANSI terminals without requesting pointer motion.
+    // Report clicks, wheel and drag coordinates, without tracking idle mouse motion.
     #[cfg(not(windows))]
     execute!(
         io::stdout(),
-        crossterm::style::Print("\x1b[?1000h\x1b[?1006h")
+        crossterm::style::Print("\x1b[?1002h\x1b[?1006h")
     )?;
     let mut term: Terminal<CrosstermBackend<Stdout>> =
         Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -2392,6 +2645,8 @@ pub fn run(db: Connection, root: String) -> Result<()> {
             refresh_due: true,
             ..Default::default()
         },
+        desktop: desktop::DesktopActions::default(),
+        mouse: pointer::MouseState::default(),
         filename_scroll: None,
         stack: vec![],
         panel: Panel::Main,
@@ -2412,7 +2667,7 @@ pub fn run(db: Connection, root: String) -> Result<()> {
     };
     let mut size = term.size()?;
     loop {
-        a.search_tick()?;
+        a.search_tick(size);
         a.references_tick();
         while let Ok(statuses) = a.git_monitor.updates.try_recv() {
             a.update_git_status(statuses);
@@ -2434,7 +2689,7 @@ pub fn run(db: Connection, root: String) -> Result<()> {
         }
         a.view_tick(size);
         a.agent_tick();
-        a.poll_hook_copy();
+        a.poll_desktop();
         let now = Instant::now();
         if let Some(scroll) = &mut a.filename_scroll
             && scroll.next <= now
@@ -2451,7 +2706,8 @@ pub fn run(db: Connection, root: String) -> Result<()> {
         } else if a.references.is_some()
             || a.views.refresh.is_some()
             || a.activity.task.is_some()
-            || a.hook_copy_pending()
+            || a.clipboard_pending()
+            || a.search.is_some()
         {
             35
         } else {
@@ -2461,12 +2717,19 @@ pub fn run(db: Connection, root: String) -> Result<()> {
         if let Some(scroll) = &a.filename_scroll {
             poll = poll.min(scroll.next.saturating_duration_since(Instant::now()));
         }
+        if let Some(when) = a.search_after {
+            poll = poll.min(when.saturating_duration_since(Instant::now()));
+        }
         if event::poll(poll)? {
             match event::read()? {
                 Event::Key(k) if k.kind != KeyEventKind::Release => {
-                    if (k.code == K::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL))
-                        || a.key(k.code, size)?
-                    {
+                    let ctrl_c =
+                        k.code == K::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
+                    if if ctrl_c {
+                        !a.copy_selection()
+                    } else {
+                        a.key(k.code, size)?
+                    } {
                         break;
                     }
                     a.dirty = true
@@ -2476,7 +2739,9 @@ pub fn run(db: Connection, root: String) -> Result<()> {
                         event.kind,
                         MouseEventKind::ScrollUp
                             | MouseEventKind::ScrollDown
-                            | MouseEventKind::Down(MouseButton::Left)
+                            | MouseEventKind::Down(MouseButton::Left | MouseButton::Right)
+                            | MouseEventKind::Drag(MouseButton::Left)
+                            | MouseEventKind::Up(MouseButton::Left)
                     ) =>
                 {
                     a.dirty |= a.mouse(event, Rect::new(0, 0, size.width, size.height))?;

@@ -159,19 +159,40 @@ pub fn capture(tool: Option<&str>) -> Result<()> {
 }
 
 pub fn hook_config(tool: &str) -> Result<()> {
+    let extension = match tool {
+        "opencode" => Some(concat!(
+            include_str!("agent/hooks/opencode-common.js"),
+            "\n",
+            include_str!("agent/hooks/opencode.js")
+        )),
+        "opencode-v2" => Some(concat!(
+            include_str!("agent/hooks/opencode-common.js"),
+            "\n",
+            include_str!("agent/hooks/opencode-v2.js")
+        )),
+        "pi" => Some(include_str!("agent/hooks/pi.js")),
+        _ => None,
+    };
+    if let Some(extension) = extension {
+        print!("{}\n{extension}", include_str!("agent/hooks/send.js"));
+        return Ok(());
+    }
     ensure!(
-        matches!(tool, "claude-code" | "codex"),
+        matches!(tool, "claude-code" | "codex" | "dsh"),
         "未知的原生 AI 适配器"
     );
     let mut hooks = serde_json::Map::new();
     let command = serde_json::json!([{"type":"command","command":format!("tt ai-hook {tool}")}]);
-    let matcher = if tool == "codex" {
-        "apply_patch"
-    } else {
-        "Edit|Write"
+    let matcher = match tool {
+        "codex" => "apply_patch",
+        "dsh" => "edit|write",
+        _ => "Edit|Write",
     };
-    for event in ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"] {
+    for event in ["SessionStart", "UserPromptSubmit", "Stop"] {
         hooks.insert(event.into(), serde_json::json!([{"hooks":command}]));
+    }
+    if tool != "dsh" {
+        hooks.insert("SessionEnd".into(), serde_json::json!([{"hooks":command}]));
     }
     if tool == "codex" {
         hooks.insert("Interrupt".into(), serde_json::json!([{"hooks":command}]));
@@ -672,6 +693,33 @@ pub fn brands() -> HashMap<String, Brand> {
                 icon: "◆".into(),
                 color: "#7FB4FF".into(),
                 ascii: Some("X".into()),
+            },
+        ),
+        (
+            "opencode".into(),
+            Brand {
+                name: "OpenCode".into(),
+                icon: "▣".into(),
+                color: "#E0E3F2".into(),
+                ascii: Some("O".into()),
+            },
+        ),
+        (
+            "pi".into(),
+            Brand {
+                name: "Pi".into(),
+                icon: "π".into(),
+                color: "#C2A2FF".into(),
+                ascii: Some("P".into()),
+            },
+        ),
+        (
+            "dsh".into(),
+            Brand {
+                name: "DeepSeek Harness".into(),
+                icon: "◈".into(),
+                color: "#829BFF".into(),
+                ascii: Some("D".into()),
             },
         ),
     ]);

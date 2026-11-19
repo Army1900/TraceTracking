@@ -89,7 +89,7 @@ fn check(case: Case) -> Result<()> {
                 root,
                 only: case.source,
                 text: "new_marker",
-                mode: 1,
+                mode: store::SearchMode::Body,
                 ..Default::default()
             }
         )?
@@ -103,7 +103,7 @@ fn check(case: Case) -> Result<()> {
                 root,
                 only: case.source,
                 text: "old_marker",
-                mode: 2,
+                mode: store::SearchMode::Changes,
                 ..Default::default()
             }
         )?

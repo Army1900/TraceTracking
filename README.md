@@ -20,23 +20,27 @@ Windows、macOS 和 Linux 使用相同命令。也可以直接执行 `cargo run 
 | ↑ ↓ / Enter / Esc | 预览、进入正文、沿原路返回 |
 | t / g | 时间轴与最近文件切换、回到最新记录 |
 | x | 只看 Git 变更 / 恢复全部 |
-| `[` / `]` | 跳到上一处或下一处变化，正文顶部显示当前位置和变化总数 |
+| `[` / `]` | 跳到上一处或下一处变化，搜索结果中跳转命中 |
 | `d` | 在正文和行级对比之间切换，保留当前变化位置 |
 | PgUp / PgDn | 按当前终端高度向前或向后翻一页 |
 | z / f / H | 折叠一分钟内相邻的同文件保存、按当前目录筛选、返回浏览起点 |
 | h / r | 查看文件历史、打开引用与定义候选 |
-| / | 搜索，Tab 选择路径、当前正文或历史变更，Enter 确定 |
+| / | 搜索路径和当前正文，Tab 切换范围，Enter 确认筛选 |
 | p / i | 切换或添加项目、选择忽略规则 |
 | G | 查看所选路径的最近 100 条 Git 提交，进入版本后用 d 与事件快照对比 |
 | ? / q | 帮助、退出 |
 
 鼠标滚轮在时间轴上切换记录，在正文上滚动当前文件，在项目、引用和忽略等列表中移动选中项。左栏每个文件占一行。选中的长文件名会横向滚动，其余超宽名称用省略号收起。选中项的完整相对路径显示在页首。
 
+单击文件可预览，双击会用系统默认应用打开磁盘上的文件。拖选右栏正文后，按 `c`、`Ctrl+C` 或在正文内右键可复制。复制保留原文的换行和制表符，视觉折行、行号与 diff 标记会省略。按 Esc 清除选区。Linux 使用 `xdg-open` 打开文件，复制使用 Wayland 或 X11 剪贴板工具。
+
 查看某行的引用时，先按 Enter 进入正文，用 ↑↓ 移到目标行，再按 `r`。查询在后台执行。结果出来后用 ↑↓ 预览，按 Enter 跳转，按 Esc 取消查询或逐层返回。
+
+搜索结果只列出命中的文件或变更。底纹标出文件名、路径和正文的命中，当前命中更亮。用 `[` / `]` 在同一行、不同位置和不同结果之间跳转。在结果列表按 Esc 恢复搜索前的视图。按 Tab 可单独搜索路径、当前正文或历史变更。
 
 `t` 在时间轴和最近文件之间切换。应用会后台准备另一视图的列表和正文预览，已有缓存时直接切换并恢复该视图的读取位置。切换后分隔线会短暂扫过高亮。
 
-正文和 diff 中的长行会随终端宽度自动折行，续行沿用同一源行的语法高亮，行号和变更标记只在首行显示。按 `d` 查看对比时，新增行用暗绿底色，删除行用暗红底色。
+正文和 diff 中的长行会随终端宽度自动折行，续行沿用同一源行的语法高亮，行号和变更标记只在首行显示。按 `d` 查看对比时，新增行用暗绿底色，删除行用暗红底色。已确认由 AI 修改的记录会在 diff 变化块首行显示该工具的彩色图标。
 
 普通目录的基线使用文件修改时间，后续追踪到的新增、修改、删除和移动仍会显示事件类型。Git 项目在左栏额外显示两格工作区状态，左格为暂存区，右格为工作区。比如 `·M` 是未暂存修改，`M·` 是已暂存修改，`MM` 是两边都有改动，`??` 是未跟踪文件。黄色表示未暂存修改，绿色表示暂存或新增，青色表示未跟踪，红色表示删除或冲突，紫色表示重命名、复制或类型变化。
 
@@ -74,7 +78,7 @@ tt hook . src/main.rs "Claude Code · session-42"
 
 首次按 `a` 打开 AI 视图时，可以用空格或鼠标勾选当前目录关注的工具，按 `n` 登记自定义工具，按 `h` 查看当前工具的 Hook 接入方式，按 `Enter` 保存。以后打开会话面板可按 `c` 修改。关注设置按项目目录保存在应用数据里，影响会话面板、顶部活动和时间轴图标。文件详情仍可以查看已有的来源证据。
 
-在 Hook 接入页按 `c`，可复制 Claude Code 或 Codex 的配置生成命令，或复制自定义工具的 JSON 示例。示例已填入当前项目路径。Linux 桌面环境使用 `wl-copy`（Wayland）或 `xclip` / `xsel`（X11）。
+在 Hook 接入页按 `c`，可复制内置工具的 Hook 生成命令，或复制自定义工具的 JSON 示例。示例已填入当前项目路径。Linux 桌面环境使用 `wl-copy`（Wayland）或 `xclip` / `xsel`（X11）。
 
 按 `a` 打开当前目录的会话面板。方向键选择会话，`Enter` 筛选它的已关联变更，`Esc` 原路返回，`d` 查看对应 diff。顶部显示当前目录的近期会话和收到目标路径的在途写入。会话从父目录启动时，写入当前目录也会出现在面板里。
 
@@ -86,6 +90,25 @@ tt ai-hook-config codex
 ```
 
 Claude Code 可合并到 `.claude/settings.local.json` 或用户设置。Codex 可合并到项目的 `.codex/hooks.json` 或用户的 `~/.codex/hooks.json`，并通过工具的 Hook 界面确认配置。默认接入 Claude Code 的 `Edit` / `Write` 与 Codex 的 `apply_patch`。前后 Hook 需要按工具默认的同步方式执行，以便在下一次写入前记录指纹。Hook 只写入必要的本地事件，正文查询、归因和会话汇总在 TraceTracking 后台执行。
+
+OpenCode、Pi 和 DeepSeek Harness（DSH）也可在关注设置里直接勾选。先创建表中的父目录，再把命令的输出以 UTF-8 保存为对应文件。每个工具需要单独启用接入，并能从 PATH 找到 `tt`。
+
+| 工具 | 生成命令 | 生成文件 |
+| --- | --- | --- |
+| OpenCode 1 | `tt ai-hook-config opencode` | `.opencode/plugins/tracetracking.ts` |
+| OpenCode 2 | `tt ai-hook-config opencode-v2` | `.opencode/plugins/tracetracking.ts` |
+| Pi | `tt ai-hook-config pi` | `.pi/extensions/tracetracking.ts` |
+| DSH | `tt ai-hook-config dsh` | `.dsh/tracetracking-hooks.json` |
+
+OpenCode 使用与当前版本对应的插件，Hook 接入页按 `c` 复制 V1 命令，按 `2` 复制 V2 命令。Pi 可用 `pi -e .pi/extensions/tracetracking.ts` 显式加载。DSH 在当前 profile 挂载与其版本匹配的 `@deepseek-ai/dsh-hooks-claude-code` 桥接插件，把 `configPath` 指向生成的 JSON。路径相对 DSH 启动目录解析，也可以填写绝对路径。
+
+```yaml
+- name: '@deepseek-ai/dsh-hooks-claude-code'
+  config:
+    configPath: ./.dsh/tracetracking-hooks.json
+```
+
+三者都记录内置文本写入和编辑，OpenCode 也记录可解析的 `apply_patch`。归因沿用文件指纹校验。 [OpenCode 插件文档](https://opencode.ai/docs/plugins/) · [Pi 扩展文档](https://docs.pi.dev/latest/extensions) · [DSH 桥接文档](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/experimental/hooks-claude-code)
 
 已验证的预期内容指纹和观察到的文件快照一致，且一个工具操作能唯一对应当前项目的一次变更时，时间轴显示工具标识。Shell、未知编辑方式、快照合并和竞争写入可能缺少可确认的来源。应用会显示「可能相关」「归属不明」或「来源未知」。超过正文快照大小的文件仍可出现在会话活动里，精确归因需要可比对的快照。
 

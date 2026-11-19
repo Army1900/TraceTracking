@@ -30,6 +30,8 @@ pub(super) fn copy(text: &str) -> bool {
 
 fn write(program: &str, args: &[&str], text: &[u8]) -> io::Result<()> {
     let mut command = Command::new(program);
+    #[cfg(target_os = "macos")]
+    command.env("LC_ALL", "en_US.UTF-8");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -42,23 +44,31 @@ fn write(program: &str, args: &[&str], text: &[u8]) -> io::Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    let written = child.stdin.take().unwrap().write_all(text);
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return written.and_then(|()| {
-                if status.success() {
-                    Ok(())
-                } else {
-                    Err(io::Error::other("clipboard command failed"))
+    let mut stdin = child.stdin.take().unwrap();
+    thread::scope(|scope| {
+        // Long selections can fill the pipe while a desktop clipboard stalls.
+        let writer = scope.spawn(move || stdin.write_all(text));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return if status.success() {
+                        writer
+                            .join()
+                            .map_err(|_| io::Error::other("clipboard write failed"))?
+                    } else {
+                        Err(io::Error::other("clipboard command failed"))
+                    };
                 }
-            });
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                result => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(result
+                        .err()
+                        .unwrap_or_else(|| io::ErrorKind::TimedOut.into()));
+                }
+            }
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(io::ErrorKind::TimedOut.into());
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+    })
 }

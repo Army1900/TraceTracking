@@ -220,14 +220,20 @@ impl Syntax {
         Self { starts, ranges }
     }
 
-    pub fn spans_in(&self, line: usize, text: &str, bytes: Range<usize>) -> Vec<Span<'static>> {
+    pub fn spans_in(
+        &self,
+        line: usize,
+        text: &str,
+        bytes: Range<usize>,
+        highlights: &[(Range<usize>, Style)],
+    ) -> Vec<Span<'static>> {
+        let mut spans = Vec::new();
         let Some(&origin) = line.checked_sub(1).and_then(|i| self.starts.get(i)) else {
-            return vec![Span::raw(terminal_text(&text[bytes]))];
+            append_highlights(&mut spans, text, bytes, Style::default(), highlights);
+            return spans;
         };
-        let text = &text[bytes.clone()];
         let start = origin + bytes.start;
         let end = origin + bytes.end;
-        let mut spans = Vec::new();
         let mut cursor = start;
         let first = self.ranges.partition_point(|(r, _)| r.end <= start);
         for (range, style) in &self.ranges[first..] {
@@ -236,21 +242,65 @@ impl Syntax {
             }
             let left = range.start.max(cursor);
             let right = range.end.min(end);
-            if let (Some(gap), Some(token)) = (
-                text.get(cursor - start..left - start),
-                text.get(left - start..right - start),
-            ) {
-                if !gap.is_empty() {
-                    spans.push(Span::raw(terminal_text(gap)));
-                }
-                spans.push(Span::styled(terminal_text(token), *style));
+            if text.get(left - origin..right - origin).is_some() {
+                append_highlights(
+                    &mut spans,
+                    text,
+                    cursor - origin..left - origin,
+                    Style::default(),
+                    highlights,
+                );
+                append_highlights(
+                    &mut spans,
+                    text,
+                    left - origin..right - origin,
+                    *style,
+                    highlights,
+                );
                 cursor = right;
             }
         }
         if cursor < end || spans.is_empty() {
-            spans.push(Span::raw(terminal_text(&text[cursor - start..])));
+            append_highlights(
+                &mut spans,
+                text,
+                cursor - origin..bytes.end,
+                Style::default(),
+                highlights,
+            );
         }
         spans
+    }
+}
+
+pub fn append_highlights(
+    spans: &mut Vec<Span<'static>>,
+    text: &str,
+    bytes: Range<usize>,
+    style: Style,
+    highlights: &[(Range<usize>, Style)],
+) {
+    let mut cursor = bytes.start;
+    let first = highlights.partition_point(|(range, _)| range.end <= cursor);
+    for (range, highlight) in &highlights[first..] {
+        if range.start >= bytes.end {
+            break;
+        }
+        let start = range.start.max(cursor);
+        let end = range.end.min(bytes.end);
+        if cursor < start {
+            spans.push(Span::styled(terminal_text(&text[cursor..start]), style));
+        }
+        if start < end {
+            spans.push(Span::styled(
+                terminal_text(&text[start..end]),
+                style.patch(*highlight),
+            ));
+        }
+        cursor = end;
+    }
+    if cursor < bytes.end {
+        spans.push(Span::styled(terminal_text(&text[cursor..bytes.end]), style));
     }
 }
 
@@ -276,7 +326,7 @@ mod tests {
             ("a.md", "# 中文标题", "# 中文标题", "keyword"),
             ("a.xml", "<item name=\"中文\"/>", "name", "attribute"),
         ] {
-            let rendered = Syntax::parse(path, Some(body)).spans_in(1, body, 0..body.len());
+            let rendered = Syntax::parse(path, Some(body)).spans_in(1, body, 0..body.len(), &[]);
             assert!(
                 rendered
                     .iter()
