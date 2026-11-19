@@ -171,6 +171,44 @@ struct ViewSwitch {
 
 const TRANSITION: Duration = Duration::from_millis(128);
 
+struct FilenameScroll {
+    id: i64,
+    name: String,
+    width: usize,
+    offset: usize,
+    next: Instant,
+}
+
+impl FilenameScroll {
+    const PAUSE: Duration = Duration::from_millis(950);
+    const STEP: Duration = Duration::from_millis(150);
+
+    fn new(id: i64, name: String, width: usize) -> Self {
+        Self {
+            id,
+            name,
+            width,
+            offset: 0,
+            next: Instant::now() + Self::PAUSE,
+        }
+    }
+
+    fn advance(&mut self, now: Instant) {
+        let rest = &self.name[self.offset..];
+        if rest.width() <= self.width {
+            self.offset = 0;
+        } else {
+            self.offset += rest.graphemes(true).next().unwrap().len();
+        }
+        let pause = self.offset == 0 || self.name[self.offset..].width() <= self.width;
+        self.next = now + if pause { Self::PAUSE } else { Self::STEP };
+    }
+
+    fn visible(&self) -> &str {
+        filename_prefix(&self.name[self.offset..], self.width)
+    }
+}
+
 struct Bookmark {
     epoch: Option<u64>,
     refilter: bool,
@@ -282,6 +320,7 @@ struct App {
     preview: Preview,
     notice: Option<&'static str>,
     views: ViewSwitch,
+    filename_scroll: Option<FilenameScroll>,
     stack: Vec<Bookmark>,
     panel: Panel,
     options: Vec<String>,
@@ -1519,22 +1558,24 @@ impl App {
         })
     }
 
-    fn event_lines(&self, pane_width: usize, height: usize, index: usize) -> Vec<Line<'static>> {
-        if height == 0 {
+    fn event_lines(
+        &mut self,
+        pane_width: usize,
+        height: usize,
+        index: usize,
+    ) -> Vec<Line<'static>> {
+        if height == 0 || self.list.is_empty() {
+            self.filename_scroll = None;
             return Vec::new();
         }
 
         let today = chrono::Local::now().date_naive();
-        let first = index.saturating_sub(height - 1);
-        let end = index.saturating_add(height).min(self.list.len());
-        let mut lines = Vec::with_capacity(end - first);
-        let mut entry_starts = Vec::with_capacity(end - first + 1);
-        let mut selected_rows = 0..0;
-        let indent = if pane_width >= 4 { "  " } else { "" };
+        let start = index
+            .saturating_sub(height / 2)
+            .min(self.list.len().saturating_sub(height));
+        let mut lines = Vec::with_capacity(height.min(self.list.len()));
 
-        for (i, e) in (first..end).zip(&self.list[first..end]) {
-            let row_start = lines.len();
-            entry_starts.push(row_start);
+        for (i, e) in self.list.iter().enumerate().skip(start).take(height) {
             let local = chrono::DateTime::from_timestamp(e.stamp, 0)
                 .map(|t| t.with_timezone(&chrono::Local));
             let time = local
@@ -1579,7 +1620,34 @@ impl App {
             let width = pane_width
                 .saturating_sub(prefix.width() + count.width() + status_width + badge_width);
             let name = terminal_text(e.path.rsplit('/').next().unwrap_or(&e.path));
-            let first_line = filename_prefix(&name, width);
+            let overflow = name.width() > width;
+            let mut display = if i == index && overflow && width > 1 {
+                if self
+                    .filename_scroll
+                    .as_ref()
+                    .is_none_or(|scroll| scroll.id != e.id || scroll.width != width)
+                {
+                    self.filename_scroll = Some(FilenameScroll::new(e.id, name, width));
+                }
+                self.filename_scroll.as_ref().unwrap().visible().to_owned()
+            } else {
+                if i == index {
+                    self.filename_scroll = None;
+                }
+                if width == 0 {
+                    String::new()
+                } else if overflow {
+                    format!("{}…", filename_prefix(&name, width - 1))
+                } else {
+                    name
+                }
+            };
+            if overflow && (!count.is_empty() || badge.is_some()) {
+                display.extend(std::iter::repeat_n(
+                    ' ',
+                    width.saturating_sub(display.width()),
+                ));
+            }
             let mut spans = vec![Span::raw(prefix)];
             let mut name_style = Style::default();
             if let Some(status) = git {
@@ -1599,7 +1667,7 @@ impl App {
                     git_style(worktree, false, conflict)
                 };
             }
-            spans.push(Span::styled(first_line.to_owned(), name_style));
+            spans.push(Span::styled(display, name_style));
             spans.push(Span::raw(count));
             if let Some((text, style)) = badge {
                 spans.push(Span::styled(text, style));
@@ -1610,44 +1678,15 @@ impl App {
                 Style::default()
             };
             lines.push(Line::from(spans).style(selected));
-
-            let mut rest = &name[first_line.len()..];
-            for _ in 1..height {
-                let chunk = filename_prefix(rest, pane_width - indent.len());
-                if chunk.is_empty() {
-                    break;
-                }
-                lines.push(
-                    Line::from(vec![
-                        Span::raw(indent),
-                        Span::styled(chunk.to_owned(), name_style),
-                    ])
-                    .style(selected),
-                );
-                rest = &rest[chunk.len()..];
-            }
-            if i == index {
-                selected_rows = row_start..lines.len();
-            }
         }
-
-        let start = visible_top(
-            selected_rows.start.saturating_sub(height / 2),
-            selected_rows.end.saturating_sub(1),
-            lines.len(),
-            height,
-        )
-        .min(selected_rows.start);
-        // Keep wrapped filenames together at the edges of the viewport.
-        entry_starts.push(lines.len());
-        let start = entry_starts[entry_starts.partition_point(|&row| row < start)];
-        let end = entry_starts[entry_starts.partition_point(|&row| row <= start + height) - 1];
-        lines.truncate(end);
-        lines.drain(..start);
         lines
     }
 
     fn draw(&mut self, f: &mut Frame) {
+        let main = matches!(self.panel, Panel::Main | Panel::Search);
+        if !main {
+            self.filename_scroll = None;
+        }
         let path = self.path_lines(f.area());
         let bands = screen_bands(f.area(), path.len() + usize::from(self.activity_visible()));
         let name = std::path::Path::new(&self.root)
@@ -1743,10 +1782,11 @@ impl App {
             self.draw_agent_setup(f, bands);
             return;
         }
-        let main = matches!(self.panel, Panel::Main | Panel::Search);
         if main {
             let [events, body] = reader_panes(bands[1], self.pos.body);
-            if !events.is_empty() {
+            if events.is_empty() {
+                self.filename_scroll = None;
+            } else {
                 let a = events;
                 let h = a.height.saturating_sub(1) as usize;
                 let index = self
@@ -2352,6 +2392,7 @@ pub fn run(db: Connection, root: String) -> Result<()> {
             refresh_due: true,
             ..Default::default()
         },
+        filename_scroll: None,
         stack: vec![],
         panel: Panel::Main,
         options: vec![],
@@ -2394,6 +2435,13 @@ pub fn run(db: Connection, root: String) -> Result<()> {
         a.view_tick(size);
         a.agent_tick();
         a.poll_hook_copy();
+        let now = Instant::now();
+        if let Some(scroll) = &mut a.filename_scroll
+            && scroll.next <= now
+        {
+            scroll.advance(now);
+            a.dirty = true;
+        }
         if a.dirty {
             term.draw(|f| a.draw(f))?;
             a.dirty = false;
@@ -2409,7 +2457,11 @@ pub fn run(db: Connection, root: String) -> Result<()> {
         } else {
             250
         };
-        if event::poll(Duration::from_millis(poll_ms))? {
+        let mut poll = Duration::from_millis(poll_ms);
+        if let Some(scroll) = &a.filename_scroll {
+            poll = poll.min(scroll.next.saturating_duration_since(Instant::now()));
+        }
+        if event::poll(poll)? {
             match event::read()? {
                 Event::Key(k) if k.kind != KeyEventKind::Release => {
                     if (k.code == K::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL))
