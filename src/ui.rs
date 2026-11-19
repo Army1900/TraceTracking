@@ -32,6 +32,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const ACC: Color = Color::Rgb(110, 199, 178);
 const DIM: Color = Color::DarkGray;
@@ -1518,6 +1519,134 @@ impl App {
         })
     }
 
+    fn event_lines(&self, pane_width: usize, height: usize, index: usize) -> Vec<Line<'static>> {
+        if height == 0 {
+            return Vec::new();
+        }
+
+        let today = chrono::Local::now().date_naive();
+        let first = index.saturating_sub(height - 1);
+        let end = index.saturating_add(height).min(self.list.len());
+        let mut lines = Vec::with_capacity(end - first);
+        let mut entry_starts = Vec::with_capacity(end - first + 1);
+        let mut selected_rows = 0..0;
+        let indent = if pane_width >= 4 { "  " } else { "" };
+
+        for (i, e) in (first..end).zip(&self.list[first..end]) {
+            let row_start = lines.len();
+            entry_starts.push(row_start);
+            let local = chrono::DateTime::from_timestamp(e.stamp, 0)
+                .map(|t| t.with_timezone(&chrono::Local));
+            let time = local
+                .map(|t| {
+                    t.format(if t.date_naive() == today {
+                        "%H:%M"
+                    } else {
+                        "%m-%d"
+                    })
+                    .to_string()
+                })
+                .unwrap_or_default();
+            let count = self
+                .groups
+                .get(&e.id)
+                .map(|(_, n)| format!(" ×{n}"))
+                .unwrap_or_default();
+            let mark = if i == index { "▸" } else { "│" };
+            let trace = if e.kind == "B" { " " } else { e.kind.as_str() };
+            let prefix = format!("{mark} {time} {trace} ");
+            let git = self
+                .git_status
+                .as_ref()
+                .and_then(|statuses| statuses.get(&e.path))
+                .copied();
+            let status_width = if git.is_some() { 3 } else { 0 };
+            let badge = match self.attribution(e) {
+                Some(Mark::Linked(identity)) if self.activity.follows(&identity.tool) => {
+                    let (mut icon, style) = self.activity.badge(identity);
+                    if pane_width >= 36 {
+                        icon.push_str(&format!(" {}", identity.short()));
+                    }
+                    Some((format!(" {icon}"), style))
+                }
+                Some(Mark::Possible(identity)) if self.activity.follows(&identity.tool) => {
+                    Some((" ?".into(), Style::new().fg(DIM)))
+                }
+                Some(Mark::Ambiguous) => Some((" ?".into(), Style::new().fg(DIM))),
+                _ => None,
+            };
+            let badge_width = badge.as_ref().map_or(0, |(text, _)| text.width());
+            let width = pane_width
+                .saturating_sub(prefix.width() + count.width() + status_width + badge_width);
+            let name = terminal_text(e.path.rsplit('/').next().unwrap_or(&e.path));
+            let first_line = filename_prefix(&name, width);
+            let mut spans = vec![Span::raw(prefix)];
+            let mut name_style = Style::default();
+            if let Some(status) = git {
+                let [staged, worktree] = status.0;
+                let conflict = status.conflicted();
+                for (code, in_index) in [(staged, true), (worktree, false)] {
+                    let glyph = if code == b' ' { '·' } else { char::from(code) };
+                    spans.push(Span::styled(
+                        glyph.to_string(),
+                        git_style(code, in_index, conflict),
+                    ));
+                }
+                spans.push(Span::raw(" "));
+                name_style = if worktree == b' ' {
+                    git_style(staged, true, conflict)
+                } else {
+                    git_style(worktree, false, conflict)
+                };
+            }
+            spans.push(Span::styled(first_line.to_owned(), name_style));
+            spans.push(Span::raw(count));
+            if let Some((text, style)) = badge {
+                spans.push(Span::styled(text, style));
+            }
+            let selected = if i == index {
+                Style::new().fg(ACC).bold()
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(spans).style(selected));
+
+            let mut rest = &name[first_line.len()..];
+            for _ in 1..height {
+                let chunk = filename_prefix(rest, pane_width - indent.len());
+                if chunk.is_empty() {
+                    break;
+                }
+                lines.push(
+                    Line::from(vec![
+                        Span::raw(indent),
+                        Span::styled(chunk.to_owned(), name_style),
+                    ])
+                    .style(selected),
+                );
+                rest = &rest[chunk.len()..];
+            }
+            if i == index {
+                selected_rows = row_start..lines.len();
+            }
+        }
+
+        let start = visible_top(
+            selected_rows.start.saturating_sub(height / 2),
+            selected_rows.end.saturating_sub(1),
+            lines.len(),
+            height,
+        )
+        .min(selected_rows.start);
+        // Keep wrapped filenames together at the edges of the viewport.
+        entry_starts.push(lines.len());
+        let start = entry_starts[entry_starts.partition_point(|&row| row < start)];
+        let end = entry_starts[entry_starts.partition_point(|&row| row <= start + height) - 1];
+        lines.truncate(end);
+        lines.drain(..start);
+        lines
+    }
+
     fn draw(&mut self, f: &mut Frame) {
         let path = self.path_lines(f.area());
         let bands = screen_bands(f.area(), path.len() + usize::from(self.activity_visible()));
@@ -1626,98 +1755,7 @@ impl App {
                     .as_ref()
                     .and_then(|e| self.list.iter().position(|x| x.id == e.id))
                     .unwrap_or(0);
-                let start = index
-                    .saturating_sub(h / 2)
-                    .min(self.list.len().saturating_sub(h));
-                let today = chrono::Local::now().date_naive();
-                let mut lines = self
-                    .list
-                    .iter()
-                    .enumerate()
-                    .skip(start)
-                    .take(h)
-                    .map(|(i, e)| {
-                        let local = chrono::DateTime::from_timestamp(e.stamp, 0)
-                            .map(|t| t.with_timezone(&chrono::Local));
-                        let time = local
-                            .map(|t| {
-                                t.format(if t.date_naive() == today {
-                                    "%H:%M"
-                                } else {
-                                    "%m-%d"
-                                })
-                                .to_string()
-                            })
-                            .unwrap_or_default();
-                        let count = self
-                            .groups
-                            .get(&e.id)
-                            .map(|(_, n)| format!(" ×{n}"))
-                            .unwrap_or_default();
-                        let mark = if i == index { "▸" } else { "│" };
-                        let trace = if e.kind == "B" { " " } else { e.kind.as_str() };
-                        let prefix = format!("{mark} {time} {trace} ");
-                        let git = self
-                            .git_status
-                            .as_ref()
-                            .and_then(|statuses| statuses.get(&e.path))
-                            .copied();
-                        let status_width = if git.is_some() { 3 } else { 0 };
-                        let badge = match self.attribution(e) {
-                            Some(Mark::Linked(identity))
-                                if self.activity.follows(&identity.tool) =>
-                            {
-                                let (mut icon, style) = self.activity.badge(identity);
-                                if a.width >= 36 {
-                                    icon.push_str(&format!(" {}", identity.short()));
-                                }
-                                Some((format!(" {icon}"), style))
-                            }
-                            Some(Mark::Possible(identity))
-                                if self.activity.follows(&identity.tool) =>
-                            {
-                                Some((" ?".into(), Style::new().fg(DIM)))
-                            }
-                            Some(Mark::Ambiguous) => Some((" ?".into(), Style::new().fg(DIM))),
-                            _ => None,
-                        };
-                        let badge_width = badge.as_ref().map_or(0, |(text, _)| text.width());
-                        let width = (a.width as usize).saturating_sub(
-                            prefix.width() + count.width() + status_width + badge_width,
-                        );
-                        let display = compact_path(&terminal_text(&e.path), width);
-                        let mut spans = vec![Span::raw(prefix)];
-                        let mut path_style = Style::default();
-                        if let Some(status) = git {
-                            let [staged, worktree] = status.0;
-                            let conflict = status.conflicted();
-                            for (code, in_index) in [(staged, true), (worktree, false)] {
-                                let glyph = if code == b' ' { '·' } else { char::from(code) };
-                                spans.push(Span::styled(
-                                    glyph.to_string(),
-                                    git_style(code, in_index, conflict),
-                                ));
-                            }
-                            spans.push(Span::raw(" "));
-                            path_style = if worktree == b' ' {
-                                git_style(staged, true, conflict)
-                            } else {
-                                git_style(worktree, false, conflict)
-                            };
-                        }
-                        spans.push(Span::styled(display, path_style));
-                        spans.push(Span::raw(count));
-                        if let Some((text, style)) = badge {
-                            spans.push(Span::styled(text, style));
-                        }
-                        let selected = if i == index {
-                            Style::new().fg(ACC).bold()
-                        } else {
-                            Style::default()
-                        };
-                        Line::from(spans).style(selected)
-                    })
-                    .collect::<Vec<_>>();
+                let mut lines = self.event_lines(a.width as usize, h, index);
                 if lines.is_empty() && self.pos.git_only && !self.views.refilter {
                     lines.push(Line::styled("暂无 Git 变更", Style::new().fg(DIM)));
                 } else if lines.is_empty() && self.pos.session.is_some() {
@@ -2146,6 +2184,20 @@ fn compact_path(path: &str, width: usize) -> String {
         "{first}{separator}{}",
         ellipsis_tail(name, available - first.width())
     )
+}
+
+fn filename_prefix(name: &str, width: usize) -> &str {
+    if name.is_ascii() {
+        return &name[..name.len().min(width)];
+    }
+    let mut used = 0;
+    for (byte, grapheme) in name.grapheme_indices(true) {
+        used += grapheme.width();
+        if used > width {
+            return &name[..byte];
+        }
+    }
+    name
 }
 
 fn take_prefix(text: &str, width: usize) -> &str {
